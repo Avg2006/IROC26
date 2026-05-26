@@ -130,9 +130,9 @@ class DronePositionMonitor(Node):
         print("=" * 50)
 
         print("Position (Relative):")
-        print(f"  X : {raw_x:.3f} m")
-        print(f"  Y : {raw_y:.3f} m")
-        print(f"  Z : {raw_z:.3f} m")
+        print(f"  X : {x:.3f} m")
+        print(f"  Y : {y:.3f} m")
+        print(f"  Z : {z:.3f} m")
 
         print("\nVelocity:")
         print(f"  Vx : {vx:.3f} m/s")
