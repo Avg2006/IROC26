@@ -47,9 +47,11 @@ class droneControl(Node):
         self.takeoff_alt = 1.5
         self.counter = 0
         self.phase = "CALIBRATE"
-        self.kp = -0.2
-        self.hover_time = 20.0
+        self.hover_time = 10.0
         self.start_time = 0.0
+
+        self.forwar_motion_start_coord = None
+        self.forward_dist = 1.2
 
         # Error info
         self.errorX = None
@@ -201,18 +203,37 @@ class droneControl(Node):
             self.get_logger().info(f"Altitude = {self.current_pos[2]:.2f}")
             if self.current_pos[2] > (self.takeoff_alt - self.pos_threshold):
                 self.get_logger().info(f"Reached {self.takeoff_alt}m -> Hovering for {self.hover_time}s")
-                self.phase = "HOVER"
+                self.phase = "HOVER1"
                 self.start_time = time()
 
         # Step 5: Hover
-        if self.phase == "HOVER":
+        if self.phase == "HOVER1":
             elapsed = time() - self.start_time
             if elapsed < self.hover_time:
-                self.get_logger().info(f"Hovering... {elapsed:.1f}s elapsed")
+                self.get_logger().info(f"Hovering... {(self.hover_time - elapsed):.1f}s left")
                 self.hover()
             else:
-                self.get_logger().info("Hover complete -> Landing")
-                self.phase = "LAND"
+                self.get_logger().info("Hover complete -> Moving Forward")
+                self.forwar_motion_start_coord = self.current_pos[0]
+                self.phase = "FORWARD"
+        
+        if self.phase == "FORWARD":
+            if self.current_pos[0] - self.forwar_motion_start_coord < self.forward_dist:
+                self.get_logger().info(f"distance left to move {self.forward_dist - (self.current_pos[0] - self.forwar_motion_start_coord)} m")
+                self.move_with_vel([0.3,0.0,0.0])
+            else: 
+                self.get_logger().info(f"GOAL REACHED -> Hovering for {self.hover_time} s")
+                self.phase = "HOVER2"
+                self.start_time = time()
+        
+        if self.phase == "HOVER2":
+            elapsed = time() - self.start_time
+            if elapsed < self.hover_time:
+                self.get_logger().info(f"Hovering... {(self.hover_time - elapsed):.1f}s left")
+                self.hover()
+            else:
+                self.get_logger().info("Hover complete -> Landig")
+                self.phase = "LAND" 
 
         # Step 6: Land
         if self.phase == "LAND":
