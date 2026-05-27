@@ -1,3 +1,7 @@
+'''
++x -> right
++y -> forward
+'''
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, TwistStamped
@@ -99,7 +103,7 @@ class droneControl(Node):
         self.current_pos[0] = raw_x - self.ref_x
         self.current_pos[1] = raw_y - self.ref_y
         self.current_pos[2] = raw_z - self.ref_z
-        print(f"x: {self.current_pos[0]:.2f}, y: {self.current_pos[1]:.2f}, z: {self.current_pos[2]:.2f}")
+        # print(f"x: {self.current_pos[0]:.2f}, y: {self.current_pos[1]:.2f}, z: {self.current_pos[2]:.2f}")
 
     # ─── Movement helpers ────────────────────────────────────────────────────────
 
@@ -114,13 +118,13 @@ class droneControl(Node):
         msg.position.z = z
         return msg
 
-    def go_to_pos(self, pos):
-        msg = self._make_pos_target(
-            pos[0] + self.ref_x,
-            pos[1] + self.ref_y,
-            pos[2] + self.ref_z
-        )
-        self.pub.publish(msg)
+    # def go_to_pos(self, pos):
+    #     msg = self._make_pos_target(
+    #         pos[0] + self.ref_x,
+    #         pos[1] + self.ref_y,
+    #         pos[2] + self.ref_z
+    #     )
+    #     self.pub.publish(msg)
 
     def hover(self):
         msg = self._make_pos_target(
@@ -130,11 +134,14 @@ class droneControl(Node):
         )
         self.pub.publish(msg)
 
-    def move_with_vel(self, vel):
+    def move_with_vel(self, vel,dir):
         velMsg = TwistStamped()
-        velMsg.twist.linear.x = vel[0]
-        velMsg.twist.linear.y = vel[1]
-        velMsg.twist.linear.z = vel[2]
+        if dir == "x":
+            velMsg.twist.linear.x = vel
+        elif dir == "y":
+            velMsg.twist.linear.y = vel
+        elif dir == "z":
+            velMsg.twist.linear.z = vel
         self.pubVel.publish(velMsg)
 
     def distance(self, initial, final):
@@ -214,13 +221,13 @@ class droneControl(Node):
                 self.hover()
             else:
                 self.get_logger().info("Hover complete -> Moving Forward")
-                self.forwar_motion_start_coord = self.current_pos[0]
+                self.forwar_motion_start_coord = self.current_pos[1]
                 self.phase = "FORWARD"
         
         if self.phase == "FORWARD":
-            if self.current_pos[0] - self.forwar_motion_start_coord < self.forward_dist:
-                self.get_logger().info(f"distance left to move {self.forward_dist - (self.current_pos[0] - self.forwar_motion_start_coord)} m")
-                self.move_with_vel([0.3,0.0,0.0])
+            if self.current_pos[1] - self.forwar_motion_start_coord < self.forward_dist -self.pos_threshold:
+                self.get_logger().info(f"distance left to move {self.forward_dist - (self.current_pos[1] - self.forwar_motion_start_coord)} m")
+                self.move_with_vel(0.3,"y")
             else: 
                 self.get_logger().info(f"GOAL REACHED -> Hovering for {self.hover_time} s")
                 self.phase = "HOVER2"
