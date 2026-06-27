@@ -71,18 +71,18 @@ class droneControl(Node):
         # Mission waypoints: (x_right, y_forward, z_alt)
         self.waypoints = [
             (0.0,  0.0, 1.5),   # 0  settle at centre after takeoff
-            (0.0,  1.0, 1.5),   # 1  forward 1 m
-            (0.0,  0.0, 1.5),   # 2  back to centre
-            (1.0,  0.0, 1.5),   # 3  right 1 m
-            (0.0,  0.0, 1.5),   # 4  back to centre
-            (0.0, -1.0, 1.5),   # 5  back 1 m
-            (0.0,  0.0, 1.5),   # 6  back to centre
-            (-1.0, 0.0, 1.5),   # 7  left 1 m
-            (0.0,  0.0, 1.5),   # 8  back to centre
-            (0.0,  0.0, 2.0),   # 9  climb to 2.0 m
-            (0.0,  0.0, 1.5),   # 10 down to 1.5 m
-            (0.0,  0.0, 1.0),   # 11 down to 1.0 m
-            (0.0,  0.0, 1.5),   # 12 up to 1.5 m
+            (0.0,  10.0, 1.5),   # 1  forward 1 m
+            (3.0,  10.0, 1.5),   # 2  back to centre
+            (3.0,  0.0, 1.5),   # 3  right 1 m
+            (6.0,  0.0, 1.5),   # 4  back to centre
+            (6.0, 10.0, 1.5),   # 5  back 1 m
+            (9.0,  10.0, 1.5),   # 6  back to centre
+            (0.0, 0.0, 1.5),   # 7  left 1 m
+            # (0.0,  0.0, 1.5),   # 8  back to centre
+            # (0.0,  0.0, 2.0),   # 9  climb to 2.0 m
+            # (0.0,  0.0, 1.5),   # 10 down to 1.5 m
+            # (0.0,  0.0, 1.0),   # 11 down to 1.0 m
+            # (0.0,  0.0, 1.5),   # 12 up to 1.5 m
         ]
         self.wp_index = 0
 
