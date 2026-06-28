@@ -5,6 +5,8 @@ from geometry_msgs.msg import PoseStamped, PoseArray
 from mavros_msgs.msg import PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from tf_transformations import euler_from_quaternion
+import math
 
 
 class droneControl(Node):
@@ -44,15 +46,16 @@ class droneControl(Node):
         self.ref_x = self.ref_y = self.ref_z = 0.0
         self.calib_start_time = time.time()
         self.calib_duration   = 3.0
+        self.locked_yaw     = None   # captured from first pose message
 
         # ── State ─────────────────────────────────────────────────────────────
         self.current_pos     = [0.0, 0.0, 0.0]
-        self.pos_threshold   = 0.15
+        self.pos_threshold   = 0.2
         self.align_threshold = 0.1
         self.takeoff_alt     = 2.0
-        self.land_alt        = 0.5
-        self.descend_step    = 0.15
-        self.hover_duration  = 1.5
+        self.land_alt        = 0.6
+        self.descend_step    = 0.1
+        self.hover_duration  = 0.5
         self.kp              = 0.5
 
         self.counter    = 0
@@ -72,6 +75,7 @@ class droneControl(Node):
 
         # ── Descent target ────────────────────────────────────────────────────
         self.descent_target = None
+        self.temp_pos = None
 
         # type_mask: position only
         self.pos_type_mask = (
@@ -81,9 +85,9 @@ class droneControl(Node):
             PositionTarget.IGNORE_AFX |
             PositionTarget.IGNORE_AFY |
             PositionTarget.IGNORE_AFZ |
-            PositionTarget.IGNORE_YAW |
             PositionTarget.IGNORE_YAW_RATE
         )
+        # PositionTarget.IGNORE_YAW |
 
         self.timer = self.create_timer(0.1, self.loop)
         self.get_logger().info("Calibrating reference frame for 3 seconds…")
@@ -96,6 +100,12 @@ class droneControl(Node):
         raw_x = msg.pose.position.x
         raw_y = msg.pose.position.y
         raw_z = msg.pose.position.z
+
+        (_, _, yaw) = euler_from_quaternion([msg.pose.orientation.x,msg.pose.orientation.y,msg.pose.orientation.z,msg.pose.orientation.w,])
+
+        if self.locked_yaw is None:
+            self.locked_yaw = yaw
+            self.get_logger().info(f"Yaw locked at {math.degrees(yaw):.1f}°")
 
         if not self.reference_set:
             elapsed = time.time() - self.calib_start_time
@@ -153,6 +163,8 @@ class droneControl(Node):
         msg.header.stamp     = self.get_clock().now().to_msg()
         msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
         msg.type_mask        = self.pos_type_mask
+        # msg.yaw = self.locked_yaw if self.locked_yaw is not None else 0.0
+        msg.yaw = math.pi/2
         msg.position.x       = target[0] + self.ref_x
         msg.position.y       = target[1] + self.ref_y
         msg.position.z       = target[2] + self.ref_z
@@ -246,10 +258,12 @@ class droneControl(Node):
             if self.current_pos[2] >= (self.takeoff_alt - self.pos_threshold):
                 self.get_logger().info("Cruise altitude reached → HOVER_WAIT\a")
                 self.phase = "HOVER_WAIT"
+                self.temp_pos = [self.current_pos[0], self.current_pos[1], self.current_pos[2]]
+
 
         # ── HOVER_WAIT ────────────────────────────────────────────────────────
         elif self.phase == "HOVER_WAIT":
-            self.hold([self.current_pos[0], self.current_pos[1], self.current_pos[2]])
+            self.hold(self.temp_pos)
             if self.aruco_detected:
                 self.get_logger().info("ArUco detected → ALIGN")
                 self.phase = "ALIGN"
