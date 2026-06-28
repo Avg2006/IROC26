@@ -1,4 +1,3 @@
-
 import rclpy
 import time
 from rclpy.node import Node
@@ -47,25 +46,34 @@ class droneControl(Node):
         self.calib_duration   = 3.0
 
         # ── State ─────────────────────────────────────────────────────────────
-        self.current_pos     = [0.0, 0.0, 0.0]   # calibrated frame
-        self.pos_threshold   = 0.15               # metres, arrival tolerance
-        self.align_threshold = 0.1                # metres, XY alignment tolerance
+        self.current_pos     = [0.0, 0.0, 0.0]
+        self.pos_threshold   = 0.15
+        self.align_threshold = 0.1
         self.takeoff_alt     = 2.0
-        self.land_alt        = 0.3                # below this → switch to LAND
-        self.descend_step    = 0.3                # metres per descent step
-        self.hover_duration  = 1.5                # seconds to hold after align
-        self.kp              = 0.5                # proportional gain for alignment
+        self.land_alt        = 0.3
+        self.descend_step    = 0.3
+        self.hover_duration  = 1.5
+        self.kp              = 0.5
 
-        self.counter     = 0
-        self.phase       = "CALIBRATE"
-        self.start_time  = 0.0
+        self.counter    = 0
+        self.phase      = "CALIBRATE"
+        self.start_time = 0.0
 
-        # ArUco
+        # ── ArUco ─────────────────────────────────────────────────────────────
         self.aruco_detected = False
-        self.error_x = 0.0   # lateral error  (camera frame → drone body +x)
-        self.error_y = 0.0   # longitudinal error
+        self.error_x = 0.0
+        self.error_y = 0.0
 
-        # type_mask: ignore everything except XYZ position
+        # Global landing target — updated every time aruco_callback fires
+        # Stored in calibrated frame: where the marker actually is in the world
+        self.last_aruco_global  = None   # [x, y, z]  calibrated frame
+        self.last_aruco_cb_time = None   # wall time of last callback entry
+        self.aruco_stale_timeout = 1.0   # seconds of silence → lost
+
+        # ── Descent target ────────────────────────────────────────────────────
+        self.descent_target = None
+
+        # type_mask: position only
         self.pos_type_mask = (
             PositionTarget.IGNORE_VX  |
             PositionTarget.IGNORE_VY  |
@@ -80,7 +88,9 @@ class droneControl(Node):
         self.timer = self.create_timer(0.1, self.loop)
         self.get_logger().info("Calibrating reference frame for 3 seconds…")
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
+    # =========================================================================
+    # Callbacks
+    # =========================================================================
 
     def pose_callback(self, msg):
         raw_x = msg.pose.position.x
@@ -113,23 +123,39 @@ class droneControl(Node):
     def aruco_callback(self, msg):
         if msg.poses:
             self.aruco_detected = True
-            # error_x / error_y = displacement of marker in camera/body frame
             self.error_x = msg.poses[0].position.x
             self.error_y = msg.poses[0].position.y
+
+            # Convert camera-frame error to global calibrated position.
+            # error_y (cam) maps to body X, error_x (cam) maps to body Y
+            # (same sign convention used in ALIGN below)
+            self.last_aruco_global = [
+                self.current_pos[0] - self.error_y,
+                self.current_pos[1] - self.error_x,
+                self.takeoff_alt,           # recover at safe cruise altitude
+            ]
+            self.last_aruco_cb_time = time.time()
+
+            self.get_logger().info(
+                f"ArUco global target → ({self.last_aruco_global[0]:.3f}, "
+                f"{self.last_aruco_global[1]:.3f})",
+                throttle_duration_sec=1.0
+            )
         else:
             self.aruco_detected = False
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # =========================================================================
+    # Helpers
+    # =========================================================================
 
     def hold(self, target):
-        """Publish a position setpoint in the calibrated frame."""
         msg = PositionTarget()
-        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.stamp     = self.get_clock().now().to_msg()
         msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
-        msg.type_mask       = self.pos_type_mask
-        msg.position.x      = target[0] + self.ref_x
-        msg.position.y      = target[1] + self.ref_y
-        msg.position.z      = target[2] + self.ref_z
+        msg.type_mask        = self.pos_type_mask
+        msg.position.x       = target[0] + self.ref_x
+        msg.position.y       = target[1] + self.ref_y
+        msg.position.z       = target[2] + self.ref_z
         self.pub.publish(msg)
 
     def arrived(self, target):
@@ -143,11 +169,13 @@ class droneControl(Node):
     def xy_aligned(self):
         return (self.error_x ** 2 + self.error_y ** 2) ** 0.5 < self.align_threshold
 
-    # ── Services ──────────────────────────────────────────────────────────────
+    # =========================================================================
+    # Services
+    # =========================================================================
 
     def takeoff(self, altitude):
         if self.takeoff_client.wait_for_service(timeout_sec=2.0):
-            req = CommandTOL.Request()
+            req           = CommandTOL.Request()
             req.altitude  = altitude
             req.min_pitch = 0.0
             req.yaw       = 0.0
@@ -174,13 +202,25 @@ class droneControl(Node):
             self.mode_client.call_async(req)
         self.phase = "DONE"
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+    # =========================================================================
+    # Main loop
+    # =========================================================================
 
     def loop(self):
         if self.phase == "CALIBRATE":
             return
 
-        # ── INIT: GUIDED → arm → takeoff ─────────────────────────────────────
+        # ── Stale ArUco check — runs every tick ───────────────────────────────
+        # If callback has stopped firing for > stale_timeout, mark as lost
+        if (
+            self.aruco_detected
+            and self.last_aruco_cb_time is not None
+            and (time.time() - self.last_aruco_cb_time) > self.aruco_stale_timeout
+        ):
+            self.aruco_detected = False
+            self.get_logger().warn("ArUco callback silent → marking lost")
+
+        # ── INIT ─────────────────────────────────────────────────────────────
         if self.phase == "INIT":
             if self.counter == 10:
                 self.get_logger().info("Switching to GUIDED…")
@@ -200,37 +240,42 @@ class droneControl(Node):
                 self.get_logger().info(f"Sending takeoff to {self.takeoff_alt} m…")
                 self.takeoff(self.takeoff_alt)
 
-        # ── TAKEOFF: wait until cruise altitude reached ───────────────────────
+        # ── TAKEOFF ───────────────────────────────────────────────────────────
         elif self.phase == "TAKEOFF":
             self.get_logger().info(f"Altitude = {self.current_pos[2]:.2f} m")
             if self.current_pos[2] >= (self.takeoff_alt - self.pos_threshold):
                 self.get_logger().info("Cruise altitude reached → HOVER_WAIT")
                 self.phase = "HOVER_WAIT"
 
-        # ── HOVER_WAIT: hold position; wait for ArUco ────────────────────────
+        # ── HOVER_WAIT ────────────────────────────────────────────────────────
         elif self.phase == "HOVER_WAIT":
             self.hold([self.current_pos[0], self.current_pos[1], self.current_pos[2]])
             if self.aruco_detected:
                 self.get_logger().info("ArUco detected → ALIGN")
                 self.phase = "ALIGN"
             else:
-                self.get_logger().info("Hovering… waiting for ArUco marker", throttle_duration_sec=1.0)
+                self.get_logger().info(
+                    "Hovering… waiting for ArUco marker",
+                    throttle_duration_sec=1.0
+                )
 
-        # ── ALIGN: proportional XY correction toward marker ──────────────────
+        # ── ALIGN ─────────────────────────────────────────────────────────────
         elif self.phase == "ALIGN":
             if not self.aruco_detected:
-                self.get_logger().warn("ArUco lost! Holding position…")
-                self.hold([self.current_pos[0], self.current_pos[1], self.current_pos[2]])
+                if self.last_aruco_global is not None:
+                    self.get_logger().warn("ArUco lost during ALIGN → RECOVER")
+                    self.phase = "RECOVER"
+                else:
+                    self.get_logger().warn("ArUco lost, no global target yet → HOVER_WAIT")
+                    self.phase = "HOVER_WAIT"
                 return
 
-            # Compute corrected XY target (stay at current altitude)
             target = [
-                self.current_pos[0] - self.error_y/2,  # cam Y  → body X
-                self.current_pos[1] - self.error_x/2,  # cam X  → body Y
+                self.current_pos[0] - self.error_y / 2,
+                self.current_pos[1] - self.error_x / 2,
                 self.current_pos[2],
             ]
             self.hold(target)
-
             self.get_logger().info(
                 f"Aligning | err_x={self.error_x:+.3f}  err_y={self.error_y:+.3f}  "
                 f"alt={self.current_pos[2]:.2f}"
@@ -241,41 +286,73 @@ class droneControl(Node):
                 self.start_time = time.time()
                 self.phase = "HOVER_ALIGNED"
 
-        # ── HOVER_ALIGNED: hold 1.5 s then decide next action ────────────────
+        # ── HOVER_ALIGNED ─────────────────────────────────────────────────────
         elif self.phase == "HOVER_ALIGNED":
             self.hold([self.current_pos[0], self.current_pos[1], self.current_pos[2]])
-            elapsed = time.time() - self.start_time
+            elapsed   = time.time() - self.start_time
             remaining = self.hover_duration - elapsed
-            self.get_logger().info(f"Hover hold… {remaining:.1f}s left  alt={self.current_pos[2]:.2f}")
+            self.get_logger().info(
+                f"Hover hold… {remaining:.1f}s left  alt={self.current_pos[2]:.2f}"
+            )
 
             if elapsed >= self.hover_duration:
                 if self.current_pos[2] < self.land_alt:
                     self.get_logger().info("Below land threshold → LAND")
                     self.phase = "LAND"
                 else:
-                    new_alt = max(
-                        self.current_pos[2] - self.descend_step,
-                        0.0
-                    )
-                    self.get_logger().info(f"Descending to {new_alt:.2f} m → DESCEND")
+                    new_alt = max(self.current_pos[2] - self.descend_step, 0.0)
                     self.descent_target = [
                         self.current_pos[0],
                         self.current_pos[1],
                         new_alt,
                     ]
+                    self.get_logger().info(f"Descending to {new_alt:.2f} m → DESCEND")
                     self.phase = "DESCEND"
 
-        # ── DESCEND: move to new altitude, then re-align ─────────────────────
+        # ── DESCEND ───────────────────────────────────────────────────────────
         elif self.phase == "DESCEND":
             self.hold(self.descent_target)
             dz = abs(self.current_pos[2] - self.descent_target[2])
-            self.get_logger().info(f"Descending… delta_z={dz:.2f}  alt={self.current_pos[2]:.2f}")
+            self.get_logger().info(
+                f"Descending… delta_z={dz:.2f}  alt={self.current_pos[2]:.2f}"
+            )
+
+            if not self.aruco_detected:
+                self.get_logger().warn("ArUco lost during DESCEND → RECOVER")
+                self.phase = "RECOVER"
+                return
 
             if self.arrived(self.descent_target):
                 self.get_logger().info("Descent complete → ALIGN")
                 self.phase = "ALIGN"
 
-        # ── LAND ─────────────────────────────────────────────────────────────
+        # ── RECOVER ───────────────────────────────────────────────────────────
+        elif self.phase == "RECOVER":
+            self.hold(self.last_aruco_global)
+            dist = (
+                (self.current_pos[0] - self.last_aruco_global[0]) ** 2 +
+                (self.current_pos[1] - self.last_aruco_global[1]) ** 2 +
+                (self.current_pos[2] - self.last_aruco_global[2]) ** 2
+            ) ** 0.5
+            self.get_logger().info(
+                f"Recovering to last ArUco global pos… dist={dist:.2f}  "
+                f"alt={self.current_pos[2]:.2f}"
+            )
+
+            # Marker reacquired mid-flight → jump straight back to ALIGN
+            if self.aruco_detected:
+                self.get_logger().info("ArUco reacquired → ALIGN")
+                self.phase = "ALIGN"
+                return
+
+            # Arrived at last known position, still no marker → hover and wait
+            if self.arrived(self.last_aruco_global):
+                self.get_logger().info(
+                    "Reached last ArUco global pos, still no marker → HOVER_WAIT"
+                )
+                self.phase = "HOVER_WAIT"
+
+        # ── LAND ──────────────────────────────────────────────────────────────
         elif self.phase == "LAND":
             self.land()
 
