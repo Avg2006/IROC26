@@ -50,8 +50,8 @@ class droneControl(Node):
         self.pos_threshold   = 0.15
         self.align_threshold = 0.1
         self.takeoff_alt     = 2.0
-        self.land_alt        = 0.3
-        self.descend_step    = 0.3
+        self.land_alt        = 0.5
+        self.descend_step    = 0.15
         self.hover_duration  = 1.5
         self.kp              = 0.5
 
@@ -130,9 +130,9 @@ class droneControl(Node):
             # error_y (cam) maps to body X, error_x (cam) maps to body Y
             # (same sign convention used in ALIGN below)
             self.last_aruco_global = [
-                self.current_pos[0] - self.error_y,
-                self.current_pos[1] - self.error_x,
-                self.takeoff_alt,           # recover at safe cruise altitude
+                self.current_pos[0] + self.error_x,
+                self.current_pos[1] - self.error_y,
+                self.current_pos[2],           # recover at safe cruise altitude
             ]
             self.last_aruco_cb_time = time.time()
 
@@ -244,7 +244,7 @@ class droneControl(Node):
         elif self.phase == "TAKEOFF":
             self.get_logger().info(f"Altitude = {self.current_pos[2]:.2f} m")
             if self.current_pos[2] >= (self.takeoff_alt - self.pos_threshold):
-                self.get_logger().info("Cruise altitude reached → HOVER_WAIT")
+                self.get_logger().info("Cruise altitude reached → HOVER_WAIT\a")
                 self.phase = "HOVER_WAIT"
 
         # ── HOVER_WAIT ────────────────────────────────────────────────────────
@@ -263,7 +263,7 @@ class droneControl(Node):
         elif self.phase == "ALIGN":
             if not self.aruco_detected:
                 if self.last_aruco_global is not None:
-                    self.get_logger().warn("ArUco lost during ALIGN → RECOVER")
+                    self.get_logger().warn("ArUco lost during ALIGN → RECOVER \a\a")
                     self.phase = "RECOVER"
                 else:
                     self.get_logger().warn("ArUco lost, no global target yet → HOVER_WAIT")
@@ -271,8 +271,8 @@ class droneControl(Node):
                 return
 
             target = [
-                self.current_pos[0] - self.error_y / 2,
-                self.current_pos[1] - self.error_x / 2,
+                self.current_pos[0] + self.error_x / 2,
+                self.current_pos[1] - self.error_y / 2,
                 self.current_pos[2],
             ]
             self.hold(target)
@@ -296,8 +296,8 @@ class droneControl(Node):
             )
 
             if elapsed >= self.hover_duration:
-                if self.current_pos[2] < self.land_alt:
-                    self.get_logger().info("Below land threshold → LAND")
+                if self.current_pos[2] <= self.land_alt:
+                    self.get_logger().info("Below land threshold → LAND\a\a\a")
                     self.phase = "LAND"
                 else:
                     new_alt = max(self.current_pos[2] - self.descend_step, 0.0)
@@ -331,8 +331,7 @@ class droneControl(Node):
             self.hold(self.last_aruco_global)
             dist = (
                 (self.current_pos[0] - self.last_aruco_global[0]) ** 2 +
-                (self.current_pos[1] - self.last_aruco_global[1]) ** 2 +
-                (self.current_pos[2] - self.last_aruco_global[2]) ** 2
+                (self.current_pos[1] - self.last_aruco_global[1]) ** 2
             ) ** 0.5
             self.get_logger().info(
                 f"Recovering to last ArUco global pos… dist={dist:.2f}  "
