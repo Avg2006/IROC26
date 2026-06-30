@@ -26,6 +26,8 @@ Mission:
 
 import rclpy
 import time
+import subprocess
+import os
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, PoseArray
 from mavros_msgs.msg import PositionTarget
@@ -48,6 +50,11 @@ class droneControl(Node):
         self.bool_pub = self.create_publisher(Bool, '/take_picture', 10)
         # Signals that the ArUco search phase has begun
         self.mission_complete_pub = self.create_publisher(Bool, '/mission_complete', 10)
+        # Signals that transfer is complete
+        # self.transfer_pub = self.create_publisher(Bool, '/transfer_complete', 10)
+
+        # /transfer_complete
+
 
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
@@ -66,6 +73,7 @@ class droneControl(Node):
             qos
         )
 
+        
         # ── Services ──────────────────────────────────────────────────────────
         self.arm_client     = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client    = self.create_client(SetMode,     '/mavros/set_mode')
@@ -107,7 +115,7 @@ class droneControl(Node):
             (-2.0,   1.0,  2.0),   #  9  (reuse centre — matches original count)
             (-2.0,  2.0,  2.0),   # 10  climb/down to 2.0 m
             (-2.0,   3.0,  2.0),
-            (0.0,   0.0,  1.5),   # 16  ← LAST WAYPOINT — return home / ArUco search
+            (0.0,   0.0,  2.0),   # 16  ← LAST WAYPOINT — return home / ArUco search
         ]
         self.LAST_WP_INDEX = len(self.waypoints) - 1  # = 16
         self.wp_index = 0
@@ -140,6 +148,9 @@ class droneControl(Node):
         self.aruco_stale_timeout = 1.0
         self.descent_target     = None
         self.temp_pos           = None  # XY held during HOVER_ALIGNED
+
+        # ── Post-land image transfer ───────────────────────────────────────────
+        self.scp_transfer_done = False
 
         self.timer = self.create_timer(0.1, self.loop)
         self.get_logger().info("Calibrating reference frame for 3 seconds…")
@@ -219,7 +230,7 @@ class droneControl(Node):
         msg.header.stamp     = self.get_clock().now().to_msg()
         msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
         msg.type_mask        = self.pos_type_mask
-        # msg.yaw              = math.radians(85)
+        # msg.yaw              = math.radians(90)
         msg.position.x       = target[0] + self.ref_x
         msg.position.y       = target[1] + self.ref_y
         msg.position.z       = target[2] + self.ref_z
@@ -283,6 +294,83 @@ class droneControl(Node):
             req.custom_mode = "LAND"
             self.mode_client.call_async(req)
         self.phase = "DONE"
+    # =========================================================================
+    # Post-land image transfer
+    # =========================================================================
+
+    def _transfer_images(self):
+        """
+        SCP all images from the Xavier's image folder to the base station
+        using sshpass for password-based authentication (no SSH key needed).
+
+        Requires sshpass to be installed on the Xavier:
+            sudo apt install sshpass
+
+        Credentials are read from scp_config.py placed next to this script.
+        """
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "scp_config.py"
+        )
+
+        if not os.path.isfile(config_path):
+            self.get_logger().error(
+                f"SCP config not found at {config_path} — skipping transfer"
+            )
+            return
+
+        # Load config as a plain namespace (avoids a full import system)
+        cfg = {}
+        with open(config_path) as f:
+            exec(f.read(), cfg)  # noqa: S102  (intentional; file is local)
+
+        bs_user   = cfg.get("BS_USER", "")
+        bs_host   = cfg.get("BS_HOST", "")
+        bs_dest   = cfg.get("BS_DEST_DIR", "")
+        image_dir = cfg.get("XAVIER_IMAGE_DIR", "")
+        password  = cfg.get("BS_PASSWORD", "")
+
+        if not all([bs_user, bs_host, bs_dest, image_dir, password]):
+            self.get_logger().error(
+                "scp_config.py is missing one or more required fields "
+                "(BS_USER, BS_HOST, BS_DEST_DIR, XAVIER_IMAGE_DIR, BS_PASSWORD) — skipping"
+            )
+            return
+
+        # sshpass feeds the password non-interactively to scp
+        # -r  : recursive (transfers entire folder)
+        # -q  : quiet (suppress progress meter in log)
+        # -o StrictHostKeyChecking=no : skip interactive host-key prompt on first connect
+        cmd = [
+            "sshpass", "-p", password,
+            "scp", "-r", "-q", "-o", "StrictHostKeyChecking=no",
+            image_dir,
+            f"{bs_user}@{bs_host}:{bs_dest}",
+        ]
+
+        # Log without exposing the password
+        safe_cmd = cmd[:2] + ["****"] + cmd[3:]
+        self.get_logger().info(f"Running: {' '.join(safe_cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,   # 2-minute hard cap; raise if folder is large
+            )
+            if result.returncode == 0:
+                self.get_logger().info("Image transfer complete.")
+            else:
+                self.get_logger().error(
+                    f"SCP failed (exit {result.returncode}): {result.stderr.strip()}"
+                )
+        except subprocess.TimeoutExpired:
+            self.get_logger().error("SCP timed out after 120 s — transfer incomplete")
+        except FileNotFoundError:
+            self.get_logger().error(
+                "sshpass not found — install it with: sudo apt install sshpass"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"SCP exception: {exc}")
 
     # =========================================================================
     # Main loop
@@ -291,6 +379,7 @@ class droneControl(Node):
     def loop(self):
         if self.phase == "CALIBRATE":
             return
+
         self.align_threshold = 0.1 + 0.2*((self.current_pos[2]-self.land_alt)/(self.takeoff_alt - self.land_alt))
         # ── Stale ArUco check ─────────────────────────────────────────────────
         if (
@@ -525,10 +614,34 @@ class droneControl(Node):
         # ── LAND (precision land after descent steps) ─────────────────────────
         elif self.phase == "LAND":
             self.land()
+            self.phase = "AFTER_LAND"
+            self.start_time = time.time()
 
         # ── LAND_SAFE (timeout / emergency fallback) ──────────────────────────
         elif self.phase == "LAND_SAFE":
             self.land()
+            self.phase = "AFTER_LAND"
+            self.start_time = time.time()
+        
+        # ── AFTER_LAND: wait for motors to fully stop, then SCP images ────────
+        elif self.phase == "AFTER_LAND":
+            elapsed = time.time() - self.start_time
+            # Give the drone a few seconds to fully settle before touching the FS
+            settle_time = 5.0
+            if elapsed < settle_time:
+                self.get_logger().info(
+                    f"Settling after land... {settle_time - elapsed:.1f}s",
+                    throttle_duration_sec=1.0
+                )
+                return
+
+            if not self.scp_transfer_done:
+                self.get_logger().info("Starting image transfer to base station...")
+                self._transfer_images()
+                self.scp_transfer_done = True
+
+            self.phase = "DONE"
+
 
         # ── DONE ─────────────────────────────────────────────────────────────
         elif self.phase == "DONE":
@@ -547,3 +660,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
