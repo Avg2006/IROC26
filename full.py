@@ -32,7 +32,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, PoseArray
 from mavros_msgs.msg import PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from tf_transformations import euler_from_quaternion
 from std_msgs.msg import Bool
 import math
@@ -52,6 +52,13 @@ class droneControl(Node):
         self.mission_complete_pub = self.create_publisher(Bool, '/mission_complete', 10)
         # Signals that transfer is complete
         # self.transfer_pub = self.create_publisher(Bool, '/transfer_complete', 10)
+
+        # Publishes current calibrated position (x, y, z) as PoseStamped
+        self.ref_odom_pub = self.create_publisher(
+            PoseStamped,
+            '/referece_odom',
+            qos_profile_sensor_data
+        )
 
         # /transfer_complete
 
@@ -197,6 +204,15 @@ class droneControl(Node):
         self.current_pos[0] = raw_x - self.ref_x
         self.current_pos[1] = raw_y - self.ref_y
         self.current_pos[2] = raw_z - self.ref_z
+
+        # Publish calibrated current position on /referece_odom
+        ref_odom_msg = PoseStamped()
+        ref_odom_msg.header.stamp = self.get_clock().now().to_msg()
+        ref_odom_msg.header.frame_id = "map"
+        ref_odom_msg.pose.position.x = self.current_pos[0]
+        ref_odom_msg.pose.position.y = self.current_pos[1]
+        ref_odom_msg.pose.position.z = self.current_pos[2]
+        self.ref_odom_pub.publish(ref_odom_msg)
 
     def aruco_callback(self, msg):
         if msg.poses:
@@ -660,4 +676,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
