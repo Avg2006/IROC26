@@ -50,10 +50,10 @@ class droneControl(Node):
 
         # ── State ─────────────────────────────────────────────────────────────
         self.current_pos     = [0.0, 0.0, 0.0]
-        self.pos_threshold   = 0.2
+        self.pos_threshold   = 0.25
         self.align_threshold = 0.1
         self.takeoff_alt     = 2.0
-        self.land_alt        = 0.6
+        self.land_alt        = 0.5
         self.descend_step    = 0.3
         self.hover_duration  = 0.5
         self.kp              = 0.5
@@ -164,7 +164,7 @@ class droneControl(Node):
         msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
         msg.type_mask        = self.pos_type_mask
         # msg.yaw = self.locked_yaw if self.locked_yaw is not None else 0.0
-        msg.yaw = math.pi/2
+        msg.yaw = math.radians(85)
         msg.position.x       = target[0] + self.ref_x
         msg.position.y       = target[1] + self.ref_y
         msg.position.z       = target[2] + self.ref_z
@@ -179,7 +179,7 @@ class droneControl(Node):
         return dist < self.pos_threshold
 
     def xy_aligned(self):
-        return (self.error_x ** 2 + self.error_y ** 2) ** 0.5 < self.align_threshold
+        return ((self.error_x ** 2)+ (self.error_y ** 2)) ** 0.5 < self.align_threshold
 
     # =========================================================================
     # Services
@@ -222,6 +222,7 @@ class droneControl(Node):
         if self.phase == "CALIBRATE":
             return
 
+        self.align_threshold = 0.1*(1 + (self.current_pos[2]-self.land_alt)/(self.takeoff_alt - self.land_alt))
         # ── Stale ArUco check — runs every tick ───────────────────────────────
         # If callback has stopped firing for > stale_timeout, mark as lost
         if (
@@ -288,14 +289,14 @@ class droneControl(Node):
                 f"alt={self.current_pos[2]:.2f}"
             )
             if self.error_x < 0:
-                error_x = max(self.error_x/2, -0.1)
+                error_x = max(self.error_x/2, -0.05)
             else: 
-                error_x = min(self.error_x/2, 0.1)
+                error_x = min(self.error_x/2, 0.05)
 
             if self.error_y < 0:
-                error_y = max(self.error_y/2, -0.1)
+                error_y = max(self.error_y/2, -0.05)
             else: 
-                error_y = min(self.error_y/2, 0.1)
+                error_y = min(self.error_y/2, 0.05)
             target = [
                 self.current_pos[0] + error_x,
                 self.current_pos[1] - error_y,
