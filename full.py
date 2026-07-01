@@ -56,13 +56,9 @@ class droneControl(Node):
         # Publishes current calibrated position (x, y, z) as PoseStamped
         self.ref_odom_pub = self.create_publisher(
             PoseStamped,
-            '/referece_odom',
+            '/reference_odom',
             qos_profile_sensor_data
         )
-
-        # /transfer_complete
-
-
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
 
@@ -117,26 +113,33 @@ class droneControl(Node):
         # waypoint that triggers the ArUco search.
         self.waypoints = [
             (0.0,   0.0,  2.0),  
-            (0.0,   1.0,  2.0),   
-            # (0.0,   2.0,  2.0),   
-            # (0.0,   3.0,  2.0),   
-            # (0.0,   4.0,  2.0),   
-            (0.0,   5.0,  2.0),   
-            (0.0,   6.0,  2.0),   
+            # (0.0,   1.0,  2.0),   
+            (0.0,   2.0,  2.0),   
+            # # (0.0,   3.0,  2.0),   
+            (0.0,   4.0,  2.0),   
+            # (0.0,   5.0,  2.0),   
+            (0.0,   6.0,  2.0),
             (-1.0,   6.0,  2.0),   
-            (-1.0,   5.0,  2.0),   
-            # (-1.0,   4.0,  2.0),   
+            # (-1.0,   5.0,  2.0),   
+            (-1.0,   4.0,  2.0),   
             # (-1.0,   3.0,  2.0),   
-            # (-1.0,  2.0,  2.0),   
-            (-1.0,   1.0,  2.0),   
+            (-1.0,  2.0,  2.0),   
+            # (-1.0,   1.0,  2.0),   
             (-1.0,  0.0,  2.0),   
             (-2.0,   0.0,  2.0),   #  8  back to centre
-            (-2.0,   1.0,  2.0),   #  9  (reuse centre — matches original count)
-            # (-2.0,  2.0,  2.0),   # 10  climb/down to 2.0 m
+            # (-2.0,   1.0,  2.0),   #  9  (reuse centre — matches original count)
+            (-2.0,  2.0,  2.0),   # 10  climb/down to 2.0 m
             # (-2.0,   3.0,  2.0),
-            # (-2.0,   4.0,  2.0),
-            (-2.0,   5.0,  2.0),
-            (-2.0,   6.0,  2.0),
+            (-2.0,   4.0,  2.0),
+            # (-2.0,   5.0,  2.0),
+            (-3.0,   6.0,  2.0),
+            (-3.0,   6.0,  2.0),   
+            # (-3.0,   5.0,  2.0),   
+            (-3.0,   4.0,  2.0),   
+            # (-3.0,   3.0,  2.0),   
+            (-3.0,  2.0,  2.0),   
+            # (-3.0,   1.0,  2.0),   
+            (-3.0,  0.0,  2.0), 
             (0.0,   0.0,  1.5),   # 16  ← LAST WAYPOINT — return home / ArUco search
         ]
         self.LAST_WP_INDEX = len(self.waypoints) - 1  # = 16
@@ -159,7 +162,7 @@ class droneControl(Node):
 
         # ── ArUco / precision-landing state (file 2) ──────────────────────────
         self.align_threshold    = 0.1
-        self.land_alt           = 0.5
+        self.land_alt           = 0.55
         self.descend_step       = 0.3
         self.hover_duration     = 0.5   # seconds to confirm alignment before descending
         self.aruco_detected     = False
@@ -170,6 +173,25 @@ class droneControl(Node):
         self.aruco_stale_timeout = 1.0
         self.descent_target     = None
         self.temp_pos           = None  # XY held during HOVER_ALIGNED
+        # ── Spiral / vicinity search state ────────────────────────────────────
+        #
+        # When the drone arrives at the last waypoint (home) without seeing the
+        # ArUco, optical-flow drift means the marker might be up to ~20 cm away
+        # from the reported home position.  ARUCO_SPIRAL_SEARCH sweeps 8 evenly-
+        # spaced points on a circle of radius `search_radius` plus the centre,
+        # hovering `search_dwell` seconds at each point before moving on.
+        # If the ArUco is detected at any point during the sweep the phase
+        # switches to ARUCO_ALIGN immediately.  If the full sweep finishes
+        # without a detection we fall through to ARUCO_HOVER_WAIT as before.
+        #
+        # The search offsets are generated once from `home` XY at the moment we
+        # enter the phase so they are expressed in the calibrated frame.
+
+        self.search_radius    = 0.18   # metres  (stays inside 20 cm budget)
+        self.search_dwell     = 0.5    # seconds to hover at each search point
+        self.search_offsets   = []     # populated when the phase starts
+        self.search_index     = 0      # which offset we are currently visiting
+        self.search_home      = None   # [x, y, z] of last waypoint at entry time
 
         # ── Post-land image transfer ───────────────────────────────────────────
         self.scp_transfer_done = False
@@ -309,6 +331,23 @@ class droneControl(Node):
         msg = Int32()
         msg.data = state
         self.transfer_pub.publish(msg)
+
+    def _build_search_offsets(self, home_x: float, home_y: float, home_z: float):
+        """
+        Build 9 search points: home centre + 8 equally-spaced points on a circle
+        of radius self.search_radius.  All expressed in the calibrated frame.
+        The centre is visited first so the drone can confirm the exact home
+        position before spiralling out.
+        """
+        pts = [[home_x, home_y, home_z]]          # index 0: centre (home)
+        for i in range(8):
+            angle = 2 * math.pi * i / 8           # 0°, 45°, 90° … 315°
+            pts.append([
+                home_x + self.search_radius * math.cos(angle),
+                home_y + self.search_radius * math.sin(angle),
+                home_z,
+            ])
+        return pts
 
     def revalidation_callback(self, msg: 'PoseArray'):
         """
@@ -564,7 +603,17 @@ class droneControl(Node):
                     self.get_logger().info(
                         "Arrived at last waypoint, no ArUco yet → ARUCO_HOVER_WAIT"
                     )
-                    self.phase = "ARUCO_HOVER_WAIT"
+                    home_x = self.waypoints[self.LAST_WP_INDEX][0]
+                    home_y = self.waypoints[self.LAST_WP_INDEX][1]
+                    home_z = self.waypoints[self.LAST_WP_INDEX][2]
+                    self.search_home    = [home_x, home_y, home_z]
+                    self.search_offsets = self._build_search_offsets(
+                        home_x, home_y, home_z
+                    )
+                    self.search_index   = 0
+                    self.start_time     = time.time()
+                    self.phase          = "ARUCO_SPIRAL_SEARCH"
+                    # self.phase = "ARUCO_HOVER_WAIT"
                 else:
                     self.get_logger().info(
                         f"Reached wp{self.wp_index} → hovering {self.hover_time}s"
@@ -594,6 +643,63 @@ class droneControl(Node):
                 # Shouldn't happen — last wp is handled in MOVE, but safety net
                 self.get_logger().info("Mission complete → landing")
                 self.phase = "LAND_SAFE"
+        # =====================================================================
+        # ── NEW: ARUCO_SPIRAL_SEARCH ──────────────────────────────────────────
+        # Sweeps 9 positions within search_radius of home to account for
+        # optical-flow drift (~20 cm budget).  Jumps to ARUCO_ALIGN the
+        # instant the marker is spotted; falls back to ARUCO_HOVER_WAIT if
+        # the whole sweep completes with no detection.
+        # =====================================================================
+        elif self.phase == "ARUCO_SPIRAL_SEARCH":
+            # ArUco detected at any point → bail out immediately
+            if self.aruco_detected:
+                self.get_logger().info(
+                    f"ArUco detected during spiral search "
+                    f"(point {self.search_index}/{len(self.search_offsets) - 1}) "
+                    f"→ ARUCO_ALIGN"
+                )
+                self.phase = "ARUCO_ALIGN"
+                return
+
+            if not self.search_offsets:
+                # Safety net — should not happen
+                self.get_logger().warn(
+                    "ARUCO_SPIRAL_SEARCH entered with no offsets → ARUCO_HOVER_WAIT"
+                )
+                self.phase = "ARUCO_HOVER_WAIT"
+                return
+
+            target  = self.search_offsets[self.search_index]
+            elapsed = time.time() - self.start_time
+
+            self.hold(target)
+
+            dx = target[0] - self.current_pos[0]
+            dy = target[1] - self.current_pos[1]
+            self.get_logger().info(
+                f"[spiral {self.search_index + 1}/{len(self.search_offsets)}] "
+                f"dx={dx:+.2f} dy={dy:+.2f}  dwell={elapsed:.1f}/"
+                f"{self.search_dwell:.1f}s",
+                throttle_duration_sec=0.5,
+            )
+
+            # Wait until we arrive AND have dwelt for search_dwell seconds
+            if self.arrived(target) and elapsed >= self.search_dwell:
+                self.search_index += 1
+                if self.search_index < len(self.search_offsets):
+                    self.get_logger().info(
+                        f"--> spiral: moving to point {self.search_index + 1}"
+                        f"/{len(self.search_offsets)}"
+                    )
+                    self.start_time = time.time()
+                    # stay in ARUCO_SPIRAL_SEARCH — target updates next tick
+                else:
+                    self.get_logger().info(
+                        "Spiral search complete, ArUco not found → ARUCO_HOVER_WAIT"
+                    )
+                    # Return to exact home position before entering hover-wait
+                    self.hold(self.search_home)
+                    self.phase = "ARUCO_HOVER_WAIT"
 
         # =====================================================================
         # ── ArUco precision-landing phases (from file 2) ─────────────────────
