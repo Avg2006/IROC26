@@ -34,7 +34,7 @@ from mavros_msgs.msg import PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from tf_transformations import euler_from_quaternion
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 import math
 
 
@@ -51,7 +51,7 @@ class droneControl(Node):
         # Signals that the ArUco search phase has begun
         self.mission_complete_pub = self.create_publisher(Bool, '/mission_complete', 10)
         # Signals that transfer is complete
-        # self.transfer_pub = self.create_publisher(Bool, '/transfer_complete', 10)
+        self.transfer_pub = self.create_publisher(Int32, '/transfer_status', 10)
 
         # Publishes current calibrated position (x, y, z) as PoseStamped
         self.ref_odom_pub = self.create_publisher(
@@ -79,7 +79,13 @@ class droneControl(Node):
             self.aruco_callback,
             qos
         )
-
+        # Revalidation coordinates sent back by the feature detection node
+        self.sub_revalidate = self.create_subscription(
+            PoseArray,
+            '/feature_coords',
+            self.revalidation_callback,
+            qos
+        )
         
         # ── Services ──────────────────────────────────────────────────────────
         self.arm_client     = self.create_client(CommandBool, '/mavros/cmd/arming')
@@ -101,7 +107,7 @@ class droneControl(Node):
         self.counter       = 0
         self.phase         = "CALIBRATE"
         self.start_time    = 0.0
-        self.move_timeout  = 20.0
+        self.move_timeout  = 60.0
 
         # ── Waypoint mission (file 1) ─────────────────────────────────────────
         self.hover_time = 3  # seconds per waypoint hover
@@ -112,17 +118,26 @@ class droneControl(Node):
         self.waypoints = [
             (0.0,   0.0,  2.0),  
             (0.0,   1.0,  2.0),   
-            (0.0,   2.0,  2.0),   
-            (0.0,   3.0,  2.0),   
-            (-1.0,   3.0,  2.0),   
-            (-1.0,  2.0,  2.0),   
+            # (0.0,   2.0,  2.0),   
+            # (0.0,   3.0,  2.0),   
+            # (0.0,   4.0,  2.0),   
+            (0.0,   5.0,  2.0),   
+            (0.0,   6.0,  2.0),   
+            (-1.0,   6.0,  2.0),   
+            (-1.0,   5.0,  2.0),   
+            # (-1.0,   4.0,  2.0),   
+            # (-1.0,   3.0,  2.0),   
+            # (-1.0,  2.0,  2.0),   
             (-1.0,   1.0,  2.0),   
             (-1.0,  0.0,  2.0),   
             (-2.0,   0.0,  2.0),   #  8  back to centre
             (-2.0,   1.0,  2.0),   #  9  (reuse centre — matches original count)
-            (-2.0,  2.0,  2.0),   # 10  climb/down to 2.0 m
-            (-2.0,   3.0,  2.0),
-            (0.0,   0.0,  2.0),   # 16  ← LAST WAYPOINT — return home / ArUco search
+            # (-2.0,  2.0,  2.0),   # 10  climb/down to 2.0 m
+            # (-2.0,   3.0,  2.0),
+            # (-2.0,   4.0,  2.0),
+            (-2.0,   5.0,  2.0),
+            (-2.0,   6.0,  2.0),
+            (0.0,   0.0,  1.5),   # 16  ← LAST WAYPOINT — return home / ArUco search
         ]
         self.LAST_WP_INDEX = len(self.waypoints) - 1  # = 16
         self.wp_index = 0
@@ -158,6 +173,14 @@ class droneControl(Node):
 
         # ── Post-land image transfer ───────────────────────────────────────────
         self.scp_transfer_done = False
+
+        # ── Revalidation waypoints (from feature detection node) ───────────────
+        # Populated by /feature_coords once /transfer_complete is published.
+        # Each entry is [x, y, z] in the calibrated frame.
+        self.revalidation_waypoints: list = []
+        self.revalidate_index = 0
+        # Altitude at which revalidation passes are flown (matches survey alt)
+        self.revalidate_alt = 2.0
 
         self.timer = self.create_timer(0.1, self.loop)
         self.get_logger().info("Calibrating reference frame for 3 seconds…")
@@ -277,6 +300,45 @@ class droneControl(Node):
         msg = Bool()
         msg.data = value
         self.mission_complete_pub.publish(msg)
+    def publish_transfer_status(self, state: int):
+        """Publish transfer status to the GUI.
+        0 = inflight
+        1 = land phase, transfer initiated
+        2 = transfer complete, awaiting instructions
+        """
+        msg = Int32()
+        msg.data = state
+        self.transfer_pub.publish(msg)
+
+    def revalidation_callback(self, msg: 'PoseArray'):
+        """
+        Receives revalidation coordinates from the feature detection node
+        on /feature_coords.  Only accepted once the image transfer is done
+        so stale or early messages are ignored.
+        Each Pose's (x, y) is treated as a calibrated-frame XY offset;
+        z is overridden by self.revalidate_alt so we fly at survey altitude.
+        """
+        if not self.scp_transfer_done:
+            self.get_logger().warn(
+                "Received /feature_coords before transfer complete — ignoring"
+            )
+            return
+
+        if not msg.poses:
+            self.get_logger().warn("Received empty /feature_coords — ignoring")
+            return
+
+        self.revalidation_waypoints = [
+            [p.position.x, p.position.y, self.revalidate_alt]
+            for p in msg.poses
+        ]
+        self.revalidate_index = 0
+        self.get_logger().info(
+            f"Received {len(self.revalidation_waypoints)} revalidation "
+            f"waypoint(s) from feature detection → REVALIDATE_MOVE"
+        )
+        self.phase = "REVALIDATE_MOVE"
+        self.start_time = time.time()
 
     # =========================================================================
     # Services
@@ -299,6 +361,7 @@ class droneControl(Node):
         result = future.result()
         if result.success:
             self.get_logger().info("Takeoff command accepted")
+            self.publish_transfer_status(0)   # GUI state 0: inflight
             self.phase = "TAKEOFF"
         else:
             self.get_logger().warn(f"Takeoff rejected (code {result.result})")
@@ -375,6 +438,7 @@ class droneControl(Node):
             )
             if result.returncode == 0:
                 self.get_logger().info("Image transfer complete.")
+                self.publish_transfer_status(2)
             else:
                 self.get_logger().error(
                     f"SCP failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -387,6 +451,22 @@ class droneControl(Node):
             )
         except Exception as exc:
             self.get_logger().error(f"SCP exception: {exc}")
+
+    def _advance_revalidation(self):
+        """Step to the next revalidation waypoint, or exit to ArUco landing."""
+        self.revalidate_index += 1
+        if self.revalidate_index < len(self.revalidation_waypoints):
+            self.get_logger().info(
+                f"--> revalidation wp{self.revalidate_index} "
+                f"{self.revalidation_waypoints[self.revalidate_index]}"
+            )
+            self.phase = "REVALIDATE_MOVE"
+            self.start_time = time.time()
+        else:
+            self.get_logger().info(
+                "All revalidation waypoints visited → ARUCO_HOVER_WAIT"
+            )
+            self.phase = "ARUCO_HOVER_WAIT"
 
     # =========================================================================
     # Main loop
@@ -653,13 +733,70 @@ class droneControl(Node):
 
             if not self.scp_transfer_done:
                 self.get_logger().info("Starting image transfer to base station...")
+                self.publish_transfer_status(1)   # GUI state 1: land phase, transfer initiated
                 self._transfer_images()
                 self.scp_transfer_done = True
 
             self.phase = "DONE"
+        # ── REVALIDATE_MOVE: fly to the next feature-detection coordinate ──────
+        elif self.phase == "REVALIDATE_MOVE_OFF":
+            if not self.revalidation_waypoints:
+                # Nothing to revalidate — proceed straight to ArUco landing
+                self.get_logger().info(
+                    "No revalidation waypoints queued → ARUCO_HOVER_WAIT"
+                )
+                self.phase = "ARUCO_HOVER_WAIT"
+                return
 
+            target = self.revalidation_waypoints[self.revalidate_index]
+            self.hold(target)
 
-        # ── DONE ─────────────────────────────────────────────────────────────
+            elapsed_move = time.time() - self.start_time
+            if elapsed_move > self.move_timeout:
+                self.get_logger().error(
+                    f"[revalidate wp{self.revalidate_index}] Timeout! "
+                    "Skipping to next."
+                )
+                self._advance_revalidation()
+                return
+
+            dx = target[0] - self.current_pos[0]
+            dy = target[1] - self.current_pos[1]
+            dz = target[2] - self.current_pos[2]
+            self.get_logger().info(
+                f"[revalidate {self.revalidate_index + 1}/"
+                f"{len(self.revalidation_waypoints)}] "
+                f"moving  dx={dx:+.2f} dy={dy:+.2f} dz={dz:+.2f}",
+                throttle_duration_sec=0.5,
+            )
+
+            if self.arrived(target):
+                self.get_logger().info(
+                    f"Reached revalidation wp{self.revalidate_index} "
+                    "→ REVALIDATE_HOVER"
+                )
+                self.trigger(True)   # rising edge → camera snapshot
+                self.phase = "REVALIDATE_HOVER"
+                self.start_time = time.time()
+
+        # ── REVALIDATE_HOVER: hold position, take picture, then continue ────────
+        elif self.phase == "REVALIDATE_HOVER_OFF":
+            target = self.revalidation_waypoints[self.revalidate_index]
+            self.hold(target)
+            elapsed = time.time() - self.start_time
+
+            if elapsed < self.hover_time:
+                self.get_logger().info(
+                    f"[revalidate {self.revalidate_index + 1}/"
+                    f"{len(self.revalidation_waypoints)}] "
+                    f"hovering… {self.hover_time - elapsed:.1f}s left",
+                    throttle_duration_sec=0.5,
+                )
+            else:
+                self.trigger(False)  # reset camera latch
+                self._advance_revalidation()
+
+        # ── DONE ─────────────────────────────────────────────────────────────────
         elif self.phase == "DONE":
             pass  # node keeps spinning; kill externally
 
@@ -676,3 +813,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
