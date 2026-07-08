@@ -39,7 +39,7 @@ class WaypointMission(Node):
         # ── General flight state ────────────────────────────────────────
         self.current_pos = [0.0, 0.0, 0.0]   # calibrated-frame (world-aligned)
         self.pos_threshold = 0.25
-        self.takeoff_alt = 2.5
+        self.takeoff_alt = 1.5
         self.hover_time = 5.0            # seconds per waypoint
         self.counter = 0
         self.phase = "CALIBRATE"

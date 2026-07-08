@@ -39,7 +39,7 @@ class WaypointFullMission(Node):
         self.corner_detected_raw = False
 
         # Debounce: require N consecutive True reads before trusting a flag
-        self.detect_confirm_needed = 3
+        self.detect_confirm_needed = 1
         self.boundary_confirm_count = 0
         self.corner_confirm_count = 0
 
@@ -87,6 +87,35 @@ class WaypointFullMission(Node):
             (0.0, 0.0, self.takeoff_alt),
             (-1.0, 0.0, self.takeoff_alt),
             (-2.0, 0.0, self.takeoff_alt),
+            (-3.0, 0.0, self.takeoff_alt),
+            (-3.0, -1.0, self.takeoff_alt),
+            (-2.0, -1.0, self.takeoff_alt),
+            (-1.0, -1.0, self.takeoff_alt),
+            (0.0, -1.0, self.takeoff_alt),
+            (0.0, -2.0, self.takeoff_alt),
+            (-1.0, -2.0, self.takeoff_alt),
+            (-2.0, -2.0, self.takeoff_alt),
+            (-3.0, -2.0, self.takeoff_alt),
+            (-3.0, -3.0, self.takeoff_alt),
+            (-2.0, -3.0, self.takeoff_alt),
+            (-1.0, -3.0, self.takeoff_alt),
+            (0.0, -3.0, self.takeoff_alt),
+            (0.0, -4.0, self.takeoff_alt),
+            (-2.0, -4.0, self.takeoff_alt),
+            (-1.0, -4.0, self.takeoff_alt),
+            (-3.0, -4.0, self.takeoff_alt),
+            (-3.0, -5.0, self.takeoff_alt),
+            (-2.0, -5.0, self.takeoff_alt),
+            (-1.0, -5.0, self.takeoff_alt),
+            (0.0, -5.0, self.takeoff_alt),
+            (0.0, -6.0, self.takeoff_alt),
+            (-1.0, -6.0, self.takeoff_alt),
+            (-2.0, -6.0, self.takeoff_alt),
+            (-3.0, -6.0, self.takeoff_alt),
+            (-3.0, -7.0, self.takeoff_alt),
+            (-2.0, -7.0, self.takeoff_alt),
+            (-1.0, -7.0, self.takeoff_alt),
+            (0.0, -7.0, self.takeoff_alt)
         ]
         # ──────────────────────────────────────────────────────────────
 
