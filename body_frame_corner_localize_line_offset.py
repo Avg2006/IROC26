@@ -3,7 +3,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy,qos_profile_sensor_data
 from geometry_msgs.msg import PoseStamped, Point
 from std_msgs.msg import Bool
 from mavros_msgs.msg import PositionTarget
@@ -19,6 +19,14 @@ class WaypointFullMission(Node):
         self.pub = self.create_publisher(
             PositionTarget, '/mavros/setpoint_raw/local', 10
         )
+
+        self.ref_odom_pub = self.create_publisher(
+            PoseStamped,
+            '/reference_odom',
+            qos_profile_sensor_data
+        )
+
+
         self.arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
@@ -50,28 +58,13 @@ class WaypointFullMission(Node):
         self.boundary_confirm_count = 0
         self.corner_confirm_count = 0
 
-        # ── Line-offset following + glitch handling ─────────────────────
-        # offset.y == 0 normally means "no line seen". But a single bad
-        # frame can also read 0 while the line is genuinely still there.
-        # So: a zero reading is NOT trusted immediately. It has to stay
-        # zero for `offset_lost_wait` seconds straight before we treat the
-        # line as actually lost. Until that grace period expires we keep
-        # using the last good (non-zero) offset for control, so the drone
-        # doesn't jerk on a single dropped frame.
         self.offset_zero_eps = 0.02        # |y| below this counts as "zero" (line lost)
         self.offset_lost_wait = 1.0        # seconds of zero before we call it lost
         self.offset_backup_dist = 0.5      # meters to back off once truly lost
         self.line_follow_gain = 1.0        # m of forward-correction per m of offset error
         self.max_follow_correction = 1.0   # clamp correction so a bad reading can't fling us
-        # offset.y is negative and grows in magnitude with standoff distance
-        # (e.g. ~-0.309 at 30cm). +1.0 or -1.0 here flips which way a
-        # correction pushes the drone -- if line-following drifts the wrong
-        # direction in testing, flip this sign, nothing else.
         self.offset_sign = -1.0
 
-        # Setpoint = the offset value we want to HOLD (captured once, when
-        # the drone first settles at the line), not zero. We're regulating
-        # "stay at the standoff distance we stopped at," not "drive to 0".
         self.line_offset_setpoint = None
 
         self.last_valid_offset_y = 0.0
@@ -220,6 +213,14 @@ class WaypointFullMission(Node):
         self.current_pos[1] = raw_y - self.ref_y
         self.current_pos[2] = raw_z - self.ref_z
 
+        ref_odom_msg = PoseStamped()
+        ref_odom_msg.header.stamp = self.get_clock().now().to_msg()
+        ref_odom_msg.header.frame_id = "map"
+        ref_odom_msg.pose.position.x = self.current_pos[0]
+        ref_odom_msg.pose.position.y = self.current_pos[1]
+        ref_odom_msg.pose.position.z = self.current_pos[2]
+        self.ref_odom_pub.publish(ref_odom_msg)
+
     def boundary_callback(self, msg):
         self.boundary_detected_raw = bool(msg.data)
 
@@ -281,17 +282,6 @@ class WaypointFullMission(Node):
         self.phase = "DONE"
 
     def update_line_offset(self):
-        """
-        Debounce /boundary_offset.y.
-
-        y != 0        -> trusted immediately, used as the live offset.
-        y == 0        -> NOT trusted immediately. We start a 1s grace
-                         timer and keep returning the last good offset
-                         during that window, so a single dropped frame
-                         doesn't cause a jerk. Only once y has read 0 for
-                         `offset_lost_wait` seconds straight do we set
-                         offset_lost_confirmed = True and return 0.0.
-        """
         y = self.boundary_offset.y
         now = time.time()
 
@@ -306,7 +296,6 @@ class WaypointFullMission(Node):
             self.offset_zero_since = now
 
         if (now - self.offset_zero_since) < self.offset_lost_wait:
-            # Inside grace period: don't trust the zero yet
             return self.last_valid_offset_y
 
         # Zero for a full second straight -> genuinely lost the line
@@ -419,13 +408,6 @@ class WaypointFullMission(Node):
                     f"{self.line_offset_setpoint:.3f}"
                 )
 
-        # ── SEARCH_RIGHT: slide right along the line until corner ──────────
-        # Instead of blindly flying to a fixed point 50m to the right, we
-        # continuously correct the "forward" axis using boundary_offset.y
-        # so the drone holds its distance from the yellow line while it
-        # slides along it. If the offset genuinely drops out (confirmed
-        # zero for 1s straight, see update_line_offset), we stop advancing
-        # right and back off 0.5m instead of ploughing on blind.
         elif self.phase == "SEARCH_RIGHT":
             offset_y = self.update_line_offset()
 
@@ -449,13 +431,7 @@ class WaypointFullMission(Node):
                     self.get_logger().error("Right search time limit exceeded -> LAND")
                     self.phase = "LAND"
                 return
-
-            # Normal case: hold the offset AT THE SETPOINT, keep sliding right.
-            # error > 0 means we've drifted further from the line than our
-            # setpoint standoff (offset_y less negative than setpoint, or
-            # vice versa depending on geometry) -- offset_sign lets you
-            # flip which way that error gets corrected without touching
-            # any other logic.
+            
             error = offset_y - self.line_offset_setpoint
             forward_correction = self.offset_sign * max(
                 -self.max_follow_correction,
