@@ -4,7 +4,7 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from geometry_msgs.msg import PoseStamped, Point
+from geometry_msgs.msg import PoseStamped, Point, PoseArray
 from std_msgs.msg import Bool
 from mavros_msgs.msg import PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
@@ -24,6 +24,10 @@ class WaypointFullMission(Node):
             '/reference_odom',
             qos_profile_sensor_data
         )
+        # Rising-edge camera trigger
+        self.bool_pub = self.create_publisher(Bool, '/take_picture', 10)
+        # Signals that the ArUco search phase has begun
+        self.mission_complete_pub = self.create_publisher(Bool, '/mission_complete', 10)
         self.arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
@@ -45,6 +49,11 @@ class WaypointFullMission(Node):
             Point, '/boundary_offset', self.offset_callback, qos
         )
         self.boundary_offset = Point()   # last raw msg (x, y, z)
+
+        # ── ArUco detector ──────────────────────────────────────────────
+        self.sub_aruco = self.create_subscription(
+            PoseArray, '/aruco_poses', self.aruco_callback, qos
+        )
 
         self.boundary_detected_raw = False
         self.corner_detected_raw = False
@@ -119,12 +128,35 @@ class WaypointFullMission(Node):
             (-2.5, -1.5, self.takeoff_alt),
             (-1.5, -1.5, self.takeoff_alt),
             (-0.5, -1.5, self.takeoff_alt),
-            (-0.5, -6.5, self.takeoff_alt),
+            (-0.5, -5.5, self.takeoff_alt)
         ]
         # ──────────────────────────────────────────────────────────────
 
         self.mission_waypoints = None   # filled in after corner stop (world frame)
         self.wp_index = 0
+
+        # ── ArUco / precision-landing state ─────────────────────────────
+        self.align_threshold = 0.1
+        self.land_alt = 0.55
+        self.descend_step = 0.3
+        self.hover_duration = 0.5        # seconds to confirm alignment before descending
+        self.aruco_detected = False
+        self.error_x = 0.0
+        self.error_y = 0.0
+        self.last_aruco_global = None    # [x, y, z] in calibrated frame
+        self.last_aruco_cb_time = None
+        self.aruco_stale_timeout = 1.0
+        self.descent_target = None
+        self.temp_pos = None             # XY held during ARUCO_HOVER_ALIGNED
+
+        # ── Spiral / vicinity search around home before giving up ──────────
+        self.search_radius = 0.18        # metres
+        self.search_dwell = 0.5          # seconds to hover at each search point
+        self.search_offsets = []
+        self.search_index = 0
+        self.search_home = None
+
+        self.mission_complete_sent = False
 
         self.pos_type_mask = (
             PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY | PositionTarget.IGNORE_VZ |
@@ -212,6 +244,27 @@ class WaypointFullMission(Node):
     def offset_callback(self, msg):
         self.boundary_offset = msg
 
+    def aruco_callback(self, msg):
+        if msg.poses:
+            self.aruco_detected = True
+            self.error_x = msg.poses[0].position.x
+            self.error_y = msg.poses[0].position.y
+
+            self.last_aruco_global = [
+                self.current_pos[0] + self.error_x,
+                self.current_pos[1] - self.error_y,
+                self.current_pos[2],
+            ]
+            self.last_aruco_cb_time = time.time()
+
+            self.get_logger().info(
+                f"ArUco global target -> ({self.last_aruco_global[0]:.3f}, "
+                f"{self.last_aruco_global[1]:.3f})",
+                throttle_duration_sec=1.0
+            )
+        else:
+            self.aruco_detected = False
+
     def update_line_offset(self):
         y = self.boundary_offset.y
         now = time.time()
@@ -254,6 +307,31 @@ class WaypointFullMission(Node):
         ) ** 0.5
         return dist < self.pos_threshold
 
+    def xy_aligned(self):
+        return (self.error_x ** 2 + self.error_y ** 2) ** 0.5 < self.align_threshold
+
+    def trigger(self, value=False):
+        """Rising edge (False->True) tells the camera node to save one frame."""
+        msg = Bool()
+        msg.data = value
+        self.bool_pub.publish(msg)
+
+    def publish_mission_complete(self, value: bool):
+        msg = Bool()
+        msg.data = value
+        self.mission_complete_pub.publish(msg)
+
+    def _build_search_offsets(self, home_x, home_y, home_z):
+        pts = [[home_x, home_y, home_z]]
+        for i in range(8):
+            angle = 2 * math.pi * i / 8
+            pts.append([
+                home_x + self.search_radius * math.cos(angle),
+                home_y + self.search_radius * math.sin(angle),
+                home_z,
+            ])
+        return pts
+
     def takeoff(self, altitude):
         if self.takeoff_client.wait_for_service(timeout_sec=2.0):
             req = CommandTOL.Request()
@@ -289,6 +367,18 @@ class WaypointFullMission(Node):
     def loop(self):
         if self.phase == "CALIBRATE":
             return
+
+        self.align_threshold = 0.1 + 0.2 * (
+            (self.current_pos[2] - self.land_alt) / (self.takeoff_alt - self.land_alt)
+        )
+
+        if (
+            self.aruco_detected
+            and self.last_aruco_cb_time is not None
+            and (time.time() - self.last_aruco_cb_time) > self.aruco_stale_timeout
+        ):
+            self.aruco_detected = False
+            self.get_logger().warn("ArUco callback silent -> marking lost")
 
         # ── INIT: GUIDED -> arm -> takeoff ──────────────────────────────
         if self.phase == "INIT":
@@ -498,12 +588,14 @@ class WaypointFullMission(Node):
             )
 
             if self.arrived(target):
+                self.trigger(True)   # rising edge -> camera snapshot
                 self.get_logger().info(f"Reached wp{self.wp_index} -> hovering {self.hover_time}s")
                 self.phase = "HOVER2"
                 self.start_time = time.time()
 
         # ── HOVER2 ───────────────────────────────────────────────────────
         elif self.phase == "HOVER2":
+            self.trigger(False)  # reset latch
             target = self.mission_waypoints[self.wp_index]
             self.hold(target)
             elapsed = time.time() - self.start_time
@@ -520,6 +612,9 @@ class WaypointFullMission(Node):
                 self.start_time = time.time()
             else:
                 self.get_logger().info("All mission waypoints complete -> returning home")
+                if not self.mission_complete_sent:
+                    self.publish_mission_complete(True)
+                    self.mission_complete_sent = True
                 self.phase = "RETURN_HOME"
                 self.start_time = time.time()
 
@@ -534,14 +629,177 @@ class WaypointFullMission(Node):
                 f"[return-home] dx={dx:+.2f} dy={dy:+.2f}", throttle_duration_sec=0.5
             )
 
+            if self.aruco_detected:
+                self.get_logger().info("ArUco detected en-route home -> ARUCO_ALIGN")
+                self.phase = "ARUCO_ALIGN"
+                return
+
             if self.arrived(self.home_position):
-                self.get_logger().info("Reached home -> landing")
-                self.phase = "LAND"
+                self.get_logger().info("Reached home, no ArUco yet -> ARUCO_SPIRAL_SEARCH")
+                self.search_home = list(self.home_position)
+                self.search_offsets = self._build_search_offsets(*self.search_home)
+                self.search_index = 0
+                self.start_time = time.time()
+                self.phase = "ARUCO_SPIRAL_SEARCH"
                 return
 
             if elapsed > self.move_timeout:
-                self.get_logger().error("Return-home timeout -> landing here")
-                self.phase = "LAND"
+                self.get_logger().error("Return-home timeout -> ARUCO_SPIRAL_SEARCH here")
+                self.search_home = list(self.current_pos)
+                self.search_offsets = self._build_search_offsets(*self.search_home)
+                self.search_index = 0
+                self.start_time = time.time()
+                self.phase = "ARUCO_SPIRAL_SEARCH"
+
+        # ── ARUCO_SPIRAL_SEARCH: sweep near home to account for drift ──────
+        elif self.phase == "ARUCO_SPIRAL_SEARCH":
+            if self.aruco_detected:
+                self.get_logger().info(
+                    f"ArUco detected during spiral search "
+                    f"(point {self.search_index}/{len(self.search_offsets) - 1}) "
+                    "-> ARUCO_ALIGN"
+                )
+                self.phase = "ARUCO_ALIGN"
+                return
+
+            if not self.search_offsets:
+                self.get_logger().warn(
+                    "ARUCO_SPIRAL_SEARCH entered with no offsets -> ARUCO_HOVER_WAIT"
+                )
+                self.phase = "ARUCO_HOVER_WAIT"
+                return
+
+            target = self.search_offsets[self.search_index]
+            elapsed = time.time() - self.start_time
+            self.hold(target)
+
+            dx = target[0] - self.current_pos[0]
+            dy = target[1] - self.current_pos[1]
+            self.get_logger().info(
+                f"[spiral {self.search_index + 1}/{len(self.search_offsets)}] "
+                f"dx={dx:+.2f} dy={dy:+.2f}  dwell={elapsed:.1f}/{self.search_dwell:.1f}s",
+                throttle_duration_sec=0.5,
+            )
+
+            if self.arrived(target) and elapsed >= self.search_dwell:
+                self.search_index += 1
+                if self.search_index < len(self.search_offsets):
+                    self.get_logger().info(
+                        f"--> spiral: moving to point {self.search_index + 1}"
+                        f"/{len(self.search_offsets)}"
+                    )
+                    self.start_time = time.time()
+                else:
+                    self.get_logger().info(
+                        "Spiral search complete, ArUco not found -> ARUCO_HOVER_WAIT"
+                    )
+                    self.hold(self.search_home)
+                    self.phase = "ARUCO_HOVER_WAIT"
+
+        # ── ARUCO_HOVER_WAIT: hold at home, keep scanning for the marker ────
+        elif self.phase == "ARUCO_HOVER_WAIT":
+            self.hold(self.home_position)
+            if self.aruco_detected:
+                self.get_logger().info("ArUco detected -> ARUCO_ALIGN")
+                self.phase = "ARUCO_ALIGN"
+            else:
+                self.get_logger().info(
+                    "Hovering at home... waiting for ArUco marker",
+                    throttle_duration_sec=1.0,
+                )
+
+        # ── ARUCO_ALIGN ──────────────────────────────────────────────────
+        elif self.phase == "ARUCO_ALIGN":
+            if not self.aruco_detected:
+                if self.last_aruco_global is not None:
+                    self.get_logger().warn("ArUco lost during ALIGN -> ARUCO_RECOVER")
+                    self.phase = "ARUCO_RECOVER"
+                else:
+                    self.get_logger().warn("ArUco lost, no global target -> ARUCO_HOVER_WAIT")
+                    self.phase = "ARUCO_HOVER_WAIT"
+                return
+
+            self.get_logger().info(
+                f"Aligning | err_x={self.error_x:+.3f}  err_y={self.error_y:+.3f}  "
+                f"alt={self.current_pos[2]:.2f}"
+            )
+
+            error_x = max(self.error_x / 2, -0.05) if self.error_x < 0 else min(self.error_x / 2, 0.05)
+            error_y = max(self.error_y / 2, -0.05) if self.error_y < 0 else min(self.error_y / 2, 0.05)
+
+            target = [
+                self.current_pos[0] + error_x,
+                self.current_pos[1] - error_y,
+                self.current_pos[2],
+            ]
+            self.hold(target)
+
+            if self.xy_aligned():
+                self.get_logger().info("Aligned -> ARUCO_HOVER_ALIGNED")
+                self.start_time = time.time()
+                self.temp_pos = [
+                    self.current_pos[0], self.current_pos[1], self.current_pos[2]
+                ]
+                self.phase = "ARUCO_HOVER_ALIGNED"
+
+        # ── ARUCO_HOVER_ALIGNED ──────────────────────────────────────────
+        elif self.phase == "ARUCO_HOVER_ALIGNED":
+            self.hold(self.temp_pos)
+            elapsed = time.time() - self.start_time
+            remaining = self.hover_duration - elapsed
+            self.get_logger().info(
+                f"Hover hold... {remaining:.1f}s left  alt={self.current_pos[2]:.2f}"
+            )
+
+            if elapsed >= self.hover_duration:
+                if self.current_pos[2] <= self.land_alt:
+                    self.get_logger().info("Below land threshold -> LAND")
+                    self.phase = "LAND"
+                else:
+                    new_alt = max(self.current_pos[2] - self.descend_step, 0.4)
+                    self.descent_target = [self.temp_pos[0], self.temp_pos[1], new_alt]
+                    self.get_logger().info(f"Descending to {new_alt:.2f} m -> ARUCO_DESCEND")
+                    self.phase = "ARUCO_DESCEND"
+
+        # ── ARUCO_DESCEND ────────────────────────────────────────────────
+        elif self.phase == "ARUCO_DESCEND":
+            self.hold(self.descent_target)
+            dz = abs(self.current_pos[2] - self.descent_target[2])
+            self.get_logger().info(
+                f"Descending... delta_z={dz:.2f}  alt={self.current_pos[2]:.2f}"
+            )
+
+            if not self.aruco_detected:
+                self.get_logger().warn("ArUco lost during DESCEND -> ARUCO_RECOVER")
+                self.phase = "ARUCO_RECOVER"
+                return
+
+            if self.arrived(self.descent_target):
+                self.get_logger().info("Descent step complete -> ARUCO_ALIGN")
+                self.phase = "ARUCO_ALIGN"
+
+        # ── ARUCO_RECOVER ────────────────────────────────────────────────
+        elif self.phase == "ARUCO_RECOVER":
+            self.hold(self.last_aruco_global)
+            dist = (
+                (self.current_pos[0] - self.last_aruco_global[0]) ** 2 +
+                (self.current_pos[1] - self.last_aruco_global[1]) ** 2
+            ) ** 0.5
+            self.get_logger().info(
+                f"Recovering to last ArUco global pos... dist={dist:.2f}  "
+                f"alt={self.current_pos[2]:.2f}"
+            )
+
+            if self.aruco_detected:
+                self.get_logger().info("ArUco reacquired -> ARUCO_ALIGN")
+                self.phase = "ARUCO_ALIGN"
+                return
+
+            if self.arrived(self.last_aruco_global):
+                self.get_logger().info(
+                    "Reached last known ArUco pos, still no marker -> ARUCO_HOVER_WAIT"
+                )
+                self.phase = "ARUCO_HOVER_WAIT"
 
         # ── LAND ─────────────────────────────────────────────────────────
         elif self.phase == "LAND":
