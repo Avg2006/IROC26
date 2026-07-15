@@ -20,31 +20,18 @@ class WaypointFullMission(Node, MissionHelpersMixin):
         self.config = MissionConfig()
         self.state = MissionState()
 
-        # ── Fixed waypoint mission (BODY frame: forward, right, alt) ──
-        # Converted to world frame at the corner, using the ALIGNED yaw.
-        self.hover_time = 5.0
-        self.mission_body_waypoints = [
-            (0.0, 0.0, self.config.takeoff_alt),
-            (-1.0, -1.0, self.config.takeoff_alt),
-            (-2.0, -1.0, self.config.takeoff_alt),
-            (-3.0, -1.0, self.config.takeoff_alt),
-            (-3.0, -2.0, self.config.takeoff_alt)
-        ]
-        self.mission_waypoints = None   # filled at CORNER_HOVER (world frame)
-        self.wp_index = 0
-
         # ── Publishers / Services ──────────────────────────────────────
         self.pub = self.create_publisher(PositionTarget, '/mavros/setpoint_raw/local', 10)
         self.bool_pub = self.create_publisher(Bool, '/take_picture', 10)
         self.ref_odom_pub = self.create_publisher(PoseStamped, '/reference_odom', qos_profile_sensor_data)
-
+        
         self.arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
 
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
-
+        
         # ── Subscribers ────────────────────────────────────────────────
         self.sub = self.create_subscription(PoseStamped, '/mavros/local_position/pose', self.pose_callback, qos)
         self.sub_boundary = self.create_subscription(Bool, '/boundary_detected', self.boundary_callback, 10)
@@ -58,18 +45,6 @@ class WaypointFullMission(Node, MissionHelpersMixin):
         self.get_logger().info("Calibrating reference frame + locking yaw for 3 seconds...")
 
     # =====================================================================
-    # Body->world conversion using the ALIGNED yaw (target_yaw).
-    # Same math as helpers.body_to_world, but rotated by the arena-aligned
-    # heading instead of the takeoff locked yaw. This is the ONLY
-    # difference vs the plain waypoint mission.
-    # =====================================================================
-    def body_to_world_aligned(self, forward, right, alt, origin=(0.0, 0.0, 0.0)):
-        yaw = self.state.target_yaw if self.state.target_yaw is not None else self.state.locked_yaw
-        world_x = origin[0] + forward * math.cos(yaw) + right * math.sin(yaw)
-        world_y = origin[1] + forward * math.sin(yaw) - right * math.cos(yaw)
-        return (world_x, world_y, alt)
-
-    # =====================================================================
     # Callbacks
     # =====================================================================
     def pose_callback(self, msg):
@@ -78,7 +53,7 @@ class WaypointFullMission(Node, MissionHelpersMixin):
         raw_z = msg.pose.position.z
 
         (_, _, yaw) = euler_from_quaternion([
-            msg.pose.orientation.x, msg.pose.orientation.y,
+            msg.pose.orientation.x, msg.pose.orientation.y, 
             msg.pose.orientation.z, msg.pose.orientation.w
         ])
         self.state.current_yaw = yaw
@@ -229,18 +204,18 @@ class WaypointFullMission(Node, MissionHelpersMixin):
                 # SEARCH_FORWARD only ever confirms on the front/back line,
                 # so that's the correct source for the yaw error here.
                 err_yaw = self.state.front_back_offset_z
-
+                
                 # Normalize error to [-pi/2, pi/2]
                 err_yaw = (err_yaw + math.pi / 2) % math.pi - math.pi / 2
 
                 self.state.yaw_arena_offset = self.state.locked_yaw - self.state.current_yaw + err_yaw
-
+                
                 # Normalize offset to [-pi, pi]
                 self.state.yaw_arena_offset = (self.state.yaw_arena_offset + math.pi) % (2 * math.pi) - math.pi
 
                 self.state.yaw_arena_offset_set = True
                 self.state.target_yaw = self.state.locked_yaw - self.state.yaw_arena_offset
-
+                
                 # Normalize target yaw to [-pi, pi]
                 self.state.target_yaw = (self.state.target_yaw + math.pi) % (2 * math.pi) - math.pi
 
@@ -269,24 +244,72 @@ class WaypointFullMission(Node, MissionHelpersMixin):
         elif self.state.phase == "BOUNDARY_HOVER":
             self.hold(self.state.boundary_origin, self.state.target_yaw)
             elapsed = time.time() - self.state.start_time
-
+            
             if elapsed >= self.config.stop_hover_time:
-                # Search right IN THE ALIGNED FRAME so we track parallel
-                # to the boundary line.
-                self.state.right_search_target = self.body_to_world_aligned(
+                # Capture the offset we're sitting at right now as the
+                # setpoint to HOLD during the right-search leg (the
+                # standoff distance the drone naturally stopped at) --
+                # we are not driving toward 0.
+                # The drone is facing straight at the boundary line after
+                # ALIGN_PERPENDICULAR, so that line is still detected as
+                # the front/back (parallel) line, not the side line.
+                self.state.line_offset_setpoint = self.state.front_back_offset_y
+                self.state.last_valid_offset_y = self.state.front_back_offset_y
+                self.state.offset_zero_since = None
+                self.state.offset_lost_confirmed = False
+
+                self.state.right_search_target = self.body_to_world(
                     0.0, self.config.search_right_distance, self.config.takeoff_alt,
                     origin=self.state.boundary_origin,
                 )
                 self.get_logger().info(
-                    f"Searching right for corner, target="
-                    f"({self.state.right_search_target[0]:.2f}, {self.state.right_search_target[1]:.2f})"
+                    f"Searching right for corner 1, holding offset setpoint "
+                    f"{self.state.line_offset_setpoint:.3f}"
                 )
                 self.state.corner_confirm_count = 0
                 self.state.phase = "SEARCH_RIGHT"
                 self.state.start_time = time.time()
 
-        # ── SEARCH_RIGHT (simple, like code 2: fly right until corner) ────
+        # ── SEARCH_RIGHT ──────────────────────────────────────────────────
+        # Rather than flying blindly to a fixed point off to the right, we
+        # continuously correct the "forward" axis using the side-line
+        # offset so the drone holds its distance from the boundary while
+        # it slides along it. If the offset genuinely drops out (confirmed
+        # zero for offset_lost_wait seconds straight, see update_line_offset),
+        # we stop advancing right and back off instead of ploughing on blind.
         elif self.state.phase == "SEARCH_RIGHT":
+            offset_y = self.update_line_offset()
+
+            if self.state.offset_lost_confirmed:
+                backup_target = self.body_to_world(
+                    self.config.offset_backup_dist, 0.0, self.config.takeoff_alt,
+                    origin=self.state.current_pos,
+                )
+                self.hold(backup_target, self.state.target_yaw)
+                self.get_logger().warn(
+                    "Line offset lost for 1s straight -> backing off to reacquire"
+                )
+                # As soon as a fresh non-zero reading comes in, resume the search
+                if abs(self.state.front_back_offset_y) > self.config.offset_zero_eps:
+                    self.state.offset_lost_confirmed = False
+                    self.state.offset_zero_since = None
+
+                elapsed = time.time() - self.state.start_time
+                if elapsed > self.config.search_max_time:
+                    self.get_logger().error("Right search time limit exceeded -> LAND")
+                    self.state.phase = "LAND"
+                return
+
+            # Normal case: hold the offset AT THE SETPOINT, keep sliding right.
+            error = offset_y - self.state.line_offset_setpoint
+            forward_correction = self.config.offset_sign * max(
+                -self.config.max_follow_correction,
+                min(self.config.max_follow_correction, error * self.config.line_follow_gain),
+            )
+            self.state.right_search_target = self.body_to_world(
+                forward_correction, self.config.search_right_distance, self.config.takeoff_alt,
+                origin=self.state.boundary_origin,
+            )
             self.hold(self.state.right_search_target, self.state.target_yaw)
 
             self.state.corner_confirm_count = self.state.corner_confirm_count + 1 if self.state.corner_detected_raw else 0
@@ -302,7 +325,7 @@ class WaypointFullMission(Node, MissionHelpersMixin):
                 self.state.corner_origin = list(self.state.current_pos)
                 self.log_corner(1, self.state.corner_origin, dist_travelled)
                 self.log_waypoint("corner1_found", self.state.corner_origin)
-                self.get_logger().info("Corner confirmed -> CORNER_HOVER")
+                self.get_logger().info("Corner 1 confirmed -> CORNER_HOVER")
                 self.state.phase = "CORNER_HOVER"
                 self.state.start_time = time.time()
                 return
@@ -312,60 +335,209 @@ class WaypointFullMission(Node, MissionHelpersMixin):
                 self.state.phase = "LAND"
                 return
 
-        # ── CORNER_HOVER: settle, build waypoint list in ALIGNED frame ────
+        # ── CORNER_HOVER (Start of Lawnmower) ─────────────────────────────
         elif self.state.phase == "CORNER_HOVER":
             self.hold(self.state.corner_origin, self.state.target_yaw)
             elapsed = time.time() - self.state.start_time
-
+            
             if elapsed >= self.config.stop_hover_time:
-                self.mission_waypoints = [
-                    self.body_to_world_aligned(f, r, a, origin=self.state.corner_origin)
-                    for (f, r, a) in self.mission_body_waypoints
-                ]
-                self.wp_index = 0
-                self.get_logger().info(
-                    f"Mission waypoints latched at corner (aligned frame, "
-                    f"yaw={math.degrees(self.state.target_yaw):.1f} deg) -> HOVER2"
+                self.state.current_row = 1
+                self.state.sweep_step_index = 0
+                self.state.cleared_start_boundary = False
+                self.state.boundary_confirm_count = 0
+                self.state.corner_confirm_count = 0
+                self.state.corners_found = 1
+                self.state.corner_seen_this_row = False
+                self.state.sweep_scan_start_time = time.time()
+                self.state.sweep_origin = list(self.state.corner_origin)
+                
+                # Target the first 1m step into the row
+                self.state.sweep_target = self.body_to_world(
+                    self.state.sweep_dir_forward * self.config.sweep_step,
+                    0.0,  # Pure forward/backward movement during the sweep
+                    self.config.takeoff_alt,
+                    origin=self.state.sweep_origin,
                 )
-                self.state.phase = "HOVER2"
+                self.trigger(True)
+                self.get_logger().info(
+                    f"CORNER_HOVER done -> starting row 1 sweep "
+                    f"(sweep_dir_forward={self.state.sweep_dir_forward:+.1f}), "
+                    f"target=({self.state.sweep_target[0]:.2f}, {self.state.sweep_target[1]:.2f}) "
+                    f"-> SWEEP_HOVER_START"
+                )
+                self.state.phase = "SWEEP_HOVER_START"
                 self.state.start_time = time.time()
 
-        # ── MOVE2 ────────────────────────────────────────────────────────
-        elif self.state.phase == "MOVE2":
-            target = self.mission_waypoints[self.wp_index]
-            self.hold(target, self.state.target_yaw)
+        # ── SWEEP_HOVER_START ─────────────────────────────────────────────
+        elif self.state.phase == "SWEEP_HOVER_START":
+            self.hold(self.state.sweep_origin, self.state.target_yaw)
+            elapsed = time.time() - self.state.start_time
+            
+            if elapsed >= self.config.sweep_hover_time:
+                self.trigger(False)
+                self.get_logger().info(
+                    f"SWEEP_HOVER_START done -> SWEEP_MOVE toward "
+                    f"({self.state.sweep_target[0]:.2f}, {self.state.sweep_target[1]:.2f})"
+                )
+                self.state.phase = "SWEEP_MOVE"
+                self.state.start_time = time.time()
+
+        # ── SWEEP_MOVE ────────────────────────────────────────────────────
+        elif self.state.phase == "SWEEP_MOVE":
+            self.hold(self.state.sweep_target, self.state.target_yaw)
+
+            # Debounce the start line to avoid false positives right after leaving
+            if not self.state.cleared_start_boundary and not self.state.boundary_detected_raw:
+                self.state.cleared_start_boundary = True
 
             elapsed_move = time.time() - self.state.start_time
             if elapsed_move > self.config.move_timeout:
-                self.get_logger().error(f"[wp{self.wp_index}] Timeout! -> RETURN_HOME")
+                self.get_logger().error("Move Timeout! -> RETURN_HOME")
                 self.state.phase = "RETURN_HOME"
                 self.state.start_time = time.time()
                 return
 
-            if self.arrived(target):
-                self.log_waypoint(f"wp{self.wp_index}", list(target))
+            if self.arrived(self.state.sweep_target):
+                self.state.sweep_step_index += 1
+                self.log_waypoint(f"row{self.state.current_row}_step{self.state.sweep_step_index}", self.state.sweep_target)
                 self.trigger(True)
-                self.get_logger().info(f"Reached wp{self.wp_index} -> hovering {self.hover_time}s")
-                self.state.phase = "HOVER2"
+                self.get_logger().info(
+                    f"Row {self.state.current_row} step {self.state.sweep_step_index} reached "
+                    f"({self.state.current_pos[0]:.2f}, {self.state.current_pos[1]:.2f}) -> SWEEP_HOVER"
+                )
+                self.state.phase = "SWEEP_HOVER"
                 self.state.start_time = time.time()
 
-        # ── HOVER2 ───────────────────────────────────────────────────────
-        elif self.state.phase == "HOVER2":
-            target = self.mission_waypoints[self.wp_index]
-            self.hold(target, self.state.target_yaw)
-            elapsed = time.time() - self.state.start_time
-            if elapsed < self.hover_time:
-                pass
-            elif self.wp_index + 1 < len(self.mission_waypoints):
-                self.trigger(False)
-                self.wp_index += 1
-                self.get_logger().info(f"--> moving to wp{self.wp_index}")
-                self.state.phase = "MOVE2"
-                self.state.start_time = time.time()
+        # ── SWEEP_HOVER ───────────────────────────────────────────────────
+        elif self.state.phase == "SWEEP_HOVER":
+            self.hold(self.state.sweep_target, self.state.target_yaw)
+
+            dist_travelled = math.sqrt(
+                (self.state.current_pos[0] - self.state.sweep_origin[0]) ** 2 +
+                (self.state.current_pos[1] - self.state.sweep_origin[1]) ** 2
+            )
+
+            # Boundary debounce (unchanged)
+            if (self.state.cleared_start_boundary and self.state.boundary_detected_raw and 
+                dist_travelled >= self.config.min_sweep_confirm_distance):
+                self.state.boundary_confirm_count += 1
             else:
+                self.state.boundary_confirm_count = 0
+
+            # NEW — corner debounce, same threshold used for corner 1
+            self.state.corner_confirm_count = (
+                self.state.corner_confirm_count + 1 if self.state.corner_detected_raw else 0
+            )
+            if self.state.corner_confirm_count >= self.config.corner_confirm_needed:
+                self.state.corner_seen_this_row = True
+
+            confirmed = (
+                self.state.cleared_start_boundary
+                and dist_travelled >= self.config.min_sweep_confirm_distance
+                and self.state.boundary_confirm_count >= self.config.detect_confirm_needed
+            )
+
+            sweep_elapsed = time.time() - self.state.sweep_scan_start_time
+
+            if confirmed:
                 self.trigger(False)
-                self.get_logger().info("All mission waypoints complete -> returning home")
+                self.get_logger().info(f"Row {self.state.current_row} complete.")
+
+                if self.state.corner_seen_this_row:
+                    self.state.corners_found += 1
+                    self.log_corner(self.state.corners_found, list(self.state.current_pos), dist_travelled)
+                    self.log_waypoint(f"corner{self.state.corners_found}_found", list(self.state.current_pos))
+
+                if self.state.corners_found >= 3 or self.state.current_row >= self.config.max_rows:
+                    reason = "3rd corner found" if self.state.corners_found >= 3 else "max_rows safety cap hit"
+                    self.get_logger().info(f"{reason} -> RETURN_HOME")
+                    self.state.phase = "RETURN_HOME"
+                    self.state.start_time = time.time()
+                    return
+                else:
+                    self.state.row_origin = list(self.state.current_pos)
+                    self.state.sweep_target = self.body_to_world(
+                        0.0,
+                        self.config.sweep_dir_right * self.config.sweep_step,
+                        self.config.takeoff_alt,
+                        origin=self.state.row_origin,
+                    )
+                    self.get_logger().info(
+                        f"Row {self.state.current_row} done -> TURN_MOVE toward "
+                        f"({self.state.sweep_target[0]:.2f}, {self.state.sweep_target[1]:.2f})"
+                    )
+                    self.state.phase = "TURN_MOVE"
+                    self.state.start_time = time.time()
+                    return
+                
+            if dist_travelled > self.config.sweep_max_distance or sweep_elapsed > self.config.sweep_max_time:
+                self.trigger(False)
+                self.get_logger().error("Sweep limit exceeded -> RETURN_HOME")
                 self.state.phase = "RETURN_HOME"
+                self.state.start_time = time.time()
+                return
+
+            elapsed = time.time() - self.state.start_time
+            if elapsed >= self.config.sweep_hover_time:
+                self.trigger(False)
+                next_step = self.state.sweep_step_index + 1
+                self.state.sweep_target = self.body_to_world(
+                    self.state.sweep_dir_forward * self.config.sweep_step * next_step,
+                    0.0,
+                    self.config.takeoff_alt,
+                    origin=self.state.sweep_origin,
+                )
+                self.state.phase = "SWEEP_MOVE"
+                self.state.start_time = time.time()
+
+        # ── TURN_MOVE (Stepping laterally to next row) ────────────────────
+        elif self.state.phase == "TURN_MOVE":
+            self.hold(self.state.sweep_target, self.state.target_yaw)
+            
+            elapsed_move = time.time() - self.state.start_time
+            if elapsed_move > self.config.move_timeout:
+                self.get_logger().error("Turn Move Timeout! -> RETURN_HOME")
+                self.state.phase = "RETURN_HOME"
+                self.state.start_time = time.time()
+                return
+
+            if self.arrived(self.state.sweep_target):
+                self.state.phase = "TURN_HOVER"
+                self.state.start_time = time.time()
+
+        # ── TURN_HOVER (Settle and setup next row) ────────────────────────
+        elif self.state.phase == "TURN_HOVER":
+            self.hold(self.state.sweep_target, self.state.target_yaw)
+            elapsed = time.time() - self.state.start_time
+            
+            if elapsed >= self.config.sweep_hover_time:
+                # Flip the travel direction purely by math (No physical yaw change)
+                self.flip_sweep_direction()
+                
+                self.state.current_row += 1
+                self.state.sweep_step_index = 0
+                self.state.cleared_start_boundary = False
+                self.state.boundary_confirm_count = 0
+                self.state.corner_confirm_count = 0
+                self.state.corner_seen_this_row = False
+                self.state.sweep_scan_start_time = time.time()
+                self.state.sweep_origin = list(self.state.current_pos)
+                
+                self.state.sweep_target = self.body_to_world(
+                    self.state.sweep_dir_forward * self.config.sweep_step,
+                    0.0,
+                    self.config.takeoff_alt,
+                    origin=self.state.sweep_origin,
+                )
+                
+                self.trigger(True)
+                self.get_logger().info(
+                    f"TURN_HOVER done -> starting row {self.state.current_row} sweep "
+                    f"(sweep_dir_forward={self.state.sweep_dir_forward:+.1f}, flipped), "
+                    f"target=({self.state.sweep_target[0]:.2f}, {self.state.sweep_target[1]:.2f}) "
+                    f"-> SWEEP_HOVER_START"
+                )
+                self.state.phase = "SWEEP_HOVER_START"
                 self.state.start_time = time.time()
 
         # ── RETURN_HOME ──────────────────────────────────────────────────
@@ -389,14 +561,12 @@ class WaypointFullMission(Node, MissionHelpersMixin):
 
         self.state.counter += 1
 
-
 def main():
     rclpy.init()
     node = WaypointFullMission()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

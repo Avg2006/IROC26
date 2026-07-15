@@ -3,13 +3,13 @@ from mavros_msgs.msg import PositionTarget
 class MissionConfig:
     def __init__(self):
         # ── Ground Testing ──
-        self.test_mode = True           # If True, drop into TEST phase after calibration
+        self.test_mode = False           # If True, drop into TEST phase after calibration
         self.test_log_interval = 1.0     # Seconds between odom diagnostic prints in TEST
 
         # ── Calibration & Thresholds ──
         self.calib_duration = 3.0
         self.pos_threshold = 0.25
-        self.takeoff_alt = 2.5
+        self.takeoff_alt = 2.0
         self.stop_hover_time = 2.0
         self.move_timeout = 60.0
         self.align_hover_time = 2.0
