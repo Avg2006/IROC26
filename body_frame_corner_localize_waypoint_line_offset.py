@@ -84,6 +84,11 @@ class WaypointFullMission(Node):
         self.calib_start_time = time.time()
         self.calib_duration = 3.0
         self.locked_yaw = None          # fixed body-frame heading (radians)
+        self.current_yaw = 0.0
+        self.target_yaw = None
+        self.yaw_arena_offset = 0.0
+        self.yaw_arena_offset_set = False
+        self.align_hover_time = 2.0    # seconds to let yaw settle before latching
 
         # ── General flight state ────────────────────────────────────────
         self.current_pos = [0.0, 0.0, 0.0]   # calibrated-frame (world-aligned)
@@ -128,6 +133,25 @@ class WaypointFullMission(Node):
             (-2.5, -1.5, self.takeoff_alt),
             (-1.5, -1.5, self.takeoff_alt),
             (-0.5, -1.5, self.takeoff_alt),
+            (-0.5, -2.5, self.takeoff_alt),
+            (-1.5, -2.5, self.takeoff_alt),
+            (-2.5, -2.5, self.takeoff_alt),
+            (-3.5, -2.5, self.takeoff_alt),
+            (-4.5, -2.5, self.takeoff_alt),
+            (-4.5, -3.5, self.takeoff_alt),
+            (-3.5, -3.5, self.takeoff_alt),
+            (-2.5, -3.5, self.takeoff_alt),
+            (-1.5, -3.5, self.takeoff_alt),
+            (-0.5, -3.5, self.takeoff_alt),
+            (-0.5, -4.5, self.takeoff_alt),
+            (-1.5, -4.5, self.takeoff_alt),
+            (-2.5, -4.5, self.takeoff_alt),
+            (-3.5, -4.5, self.takeoff_alt),
+            (-4.5, -4.5, self.takeoff_alt),
+            (-4.5, -5.5, self.takeoff_alt),
+            (-3.5, -5.5, self.takeoff_alt),
+            (-2.5, -5.5, self.takeoff_alt),
+            (-1.5, -5.5, self.takeoff_alt),
             (-0.5, -5.5, self.takeoff_alt)
         ]
         # ──────────────────────────────────────────────────────────────
@@ -171,7 +195,7 @@ class WaypointFullMission(Node):
     # Body-frame -> world-frame conversion (uses the ONE locked yaw)
     # =====================================================================
     def body_to_world(self, forward, right, alt, origin=(0.0, 0.0, 0.0)):
-        yaw = self.locked_yaw
+        yaw = self.locked_yaw - self.yaw_arena_offset
         world_x = origin[0] + forward * math.cos(yaw) + right * math.sin(yaw)
         world_y = origin[1] + forward * math.sin(yaw) - right * math.cos(yaw)
         return (world_x, world_y, alt)
@@ -190,6 +214,8 @@ class WaypointFullMission(Node):
             msg.pose.orientation.z,
             msg.pose.orientation.w,
         ])
+
+        self.current_yaw = yaw
 
         if self.locked_yaw is None:
             self.locked_yaw = yaw
@@ -289,11 +315,19 @@ class WaypointFullMission(Node):
     # =====================================================================
     # Helpers
     # =====================================================================
-    def hold(self, target):
+    def hold(self, target, yaw=None):
         msg = PositionTarget()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
-        msg.type_mask = self.pos_type_mask
+        if yaw is not None:
+            msg.type_mask = (
+                PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY | PositionTarget.IGNORE_VZ |
+                PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
+                PositionTarget.IGNORE_YAW_RATE
+            )
+            msg.yaw = yaw
+        else:
+            msg.type_mask = self.pos_type_mask
         msg.position.x = target[0] + self.ref_x
         msg.position.y = target[1] + self.ref_y
         msg.position.z = target[2] + self.ref_z
@@ -403,8 +437,9 @@ class WaypointFullMission(Node):
             self.get_logger().info(f"Altitude = {self.current_pos[2]:.2f} m")
             if self.current_pos[2] >= (self.takeoff_alt - self.pos_threshold):
                 self.home_position = [
-                    self.current_pos[0], self.current_pos[1], self.takeoff_alt
+                    self.current_pos[0], self.current_pos[1], self.takeoff_alt-1.0
                 ]
+                self.target_yaw = self.locked_yaw
                 self.get_logger().info(
                     f"Takeoff altitude reached, HOME latched at {self.home_position} "
                     "-> searching forward for yellow line"
@@ -414,7 +449,7 @@ class WaypointFullMission(Node):
 
         # ── SEARCH_FORWARD: fly forward until yellow line ──────────────────
         elif self.phase == "SEARCH_FORWARD":
-            self.hold(self.forward_search_target)
+            self.hold(self.forward_search_target, self.target_yaw)
 
             if self.boundary_detected_raw:
                 self.boundary_confirm_count += 1
@@ -436,11 +471,12 @@ class WaypointFullMission(Node):
                 self.boundary_origin = [
                     self.current_pos[0], self.current_pos[1], self.current_pos[2]
                 ]
+                self.yaw_arena_offset_set = False
                 self.get_logger().info(
                     f"Yellow line confirmed -> stopping at {self.boundary_origin} "
-                    "-> BOUNDARY_HOVER"
+                    "-> ALIGN_PERPENDICULAR"
                 )
-                self.phase = "BOUNDARY_HOVER"
+                self.phase = "ALIGN_PERPENDICULAR"
                 self.start_time = time.time()
                 return
 
@@ -453,9 +489,40 @@ class WaypointFullMission(Node):
                 self.phase = "LAND"
                 return
 
+        # ── ALIGN_PERPENDICULAR: rotate to square up with the boundary line ─
+        elif self.phase == "ALIGN_PERPENDICULAR":
+            self.hold(self.boundary_origin, self.target_yaw)
+
+            if not self.yaw_arena_offset_set:
+                err_yaw = self.boundary_offset.z
+                err_yaw = (err_yaw + math.pi / 2) % math.pi - math.pi / 2
+
+                self.yaw_arena_offset = self.locked_yaw - self.current_yaw + err_yaw
+                self.yaw_arena_offset = (self.yaw_arena_offset + math.pi) % (2 * math.pi) - math.pi
+
+                self.yaw_arena_offset_set = True
+                self.target_yaw = self.locked_yaw - self.yaw_arena_offset
+                self.target_yaw = (self.target_yaw + math.pi) % (2 * math.pi) - math.pi
+
+                self.start_time = time.time()
+                return
+
+            elapsed = time.time() - self.start_time
+            if elapsed < self.align_hover_time:
+                return
+
+            self.boundary_origin = list(self.current_pos)
+            self.get_logger().info(
+                f"Alignment complete -> origin latched at "
+                f"({self.boundary_origin[0]:.2f}, {self.boundary_origin[1]:.2f}) "
+                "-> BOUNDARY_HOVER"
+            )
+            self.phase = "BOUNDARY_HOVER"
+            self.start_time = time.time()
+
         # ── BOUNDARY_HOVER: settle at the line, then search right ──────────
         elif self.phase == "BOUNDARY_HOVER":
-            self.hold(self.boundary_origin)
+            self.hold(self.boundary_origin, self.target_yaw)
             elapsed = time.time() - self.start_time
             if elapsed < self.stop_hover_time:
                 self.get_logger().info(
@@ -484,7 +551,7 @@ class WaypointFullMission(Node):
                     self.offset_backup_dist, 0.0, self.takeoff_alt,
                     origin=self.current_pos,
                 )
-                self.hold(backup_target)
+                self.hold(backup_target, self.target_yaw)
                 self.get_logger().warn(
                     "Line offset lost for 1s straight -> backing off 0.5 m to reacquire",
                     throttle_duration_sec=1.0,
@@ -508,7 +575,7 @@ class WaypointFullMission(Node):
                 forward_correction, self.search_right_distance, self.takeoff_alt,
                 origin=self.boundary_origin,
             )
-            self.hold(self.right_search_target)
+            self.hold(self.right_search_target, self.target_yaw)
 
             if self.corner_detected_raw:
                 self.corner_confirm_count += 1
@@ -550,7 +617,7 @@ class WaypointFullMission(Node):
 
         # ── CORNER_HOVER: settle, latch corner as waypoint-list origin ─────
         elif self.phase == "CORNER_HOVER":
-            self.hold(self.corner_origin)
+            self.hold(self.corner_origin, self.target_yaw)
             elapsed = time.time() - self.start_time
             if elapsed < self.stop_hover_time:
                 self.get_logger().info(
@@ -571,7 +638,7 @@ class WaypointFullMission(Node):
         # ── MOVE2 ────────────────────────────────────────────────────────
         elif self.phase == "MOVE2":
             target = self.mission_waypoints[self.wp_index]
-            self.hold(target)
+            self.hold(target, self.target_yaw)
 
             elapsed_move = time.time() - self.start_time
             if elapsed_move > self.move_timeout:
@@ -597,7 +664,7 @@ class WaypointFullMission(Node):
         elif self.phase == "HOVER2":
             self.trigger(False)  # reset latch
             target = self.mission_waypoints[self.wp_index]
-            self.hold(target)
+            self.hold(target, self.target_yaw)
             elapsed = time.time() - self.start_time
             if elapsed < self.hover_time:
                 self.get_logger().info(
@@ -620,7 +687,7 @@ class WaypointFullMission(Node):
 
         # ── RETURN_HOME ──────────────────────────────────────────────────
         elif self.phase == "RETURN_HOME":
-            self.hold(self.home_position)
+            self.hold(self.home_position, self.target_yaw)
             elapsed = time.time() - self.start_time
 
             dx = self.home_position[0] - self.current_pos[0]
@@ -671,7 +738,7 @@ class WaypointFullMission(Node):
 
             target = self.search_offsets[self.search_index]
             elapsed = time.time() - self.start_time
-            self.hold(target)
+            self.hold(target, self.target_yaw)
 
             dx = target[0] - self.current_pos[0]
             dy = target[1] - self.current_pos[1]
@@ -693,12 +760,12 @@ class WaypointFullMission(Node):
                     self.get_logger().info(
                         "Spiral search complete, ArUco not found -> ARUCO_HOVER_WAIT"
                     )
-                    self.hold(self.search_home)
+                    self.hold(self.search_home, self.target_yaw)
                     self.phase = "ARUCO_HOVER_WAIT"
 
         # ── ARUCO_HOVER_WAIT: hold at home, keep scanning for the marker ────
         elif self.phase == "ARUCO_HOVER_WAIT":
-            self.hold(self.home_position)
+            self.hold(self.home_position, self.target_yaw)
             if self.aruco_detected:
                 self.get_logger().info("ArUco detected -> ARUCO_ALIGN")
                 self.phase = "ARUCO_ALIGN"
@@ -732,7 +799,7 @@ class WaypointFullMission(Node):
                 self.current_pos[1] - error_y,
                 self.current_pos[2],
             ]
-            self.hold(target)
+            self.hold(target, self.target_yaw)
 
             if self.xy_aligned():
                 self.get_logger().info("Aligned -> ARUCO_HOVER_ALIGNED")
@@ -744,7 +811,7 @@ class WaypointFullMission(Node):
 
         # ── ARUCO_HOVER_ALIGNED ──────────────────────────────────────────
         elif self.phase == "ARUCO_HOVER_ALIGNED":
-            self.hold(self.temp_pos)
+            self.hold(self.temp_pos, self.target_yaw)
             elapsed = time.time() - self.start_time
             remaining = self.hover_duration - elapsed
             self.get_logger().info(
@@ -763,7 +830,7 @@ class WaypointFullMission(Node):
 
         # ── ARUCO_DESCEND ────────────────────────────────────────────────
         elif self.phase == "ARUCO_DESCEND":
-            self.hold(self.descent_target)
+            self.hold(self.descent_target, self.target_yaw)
             dz = abs(self.current_pos[2] - self.descent_target[2])
             self.get_logger().info(
                 f"Descending... delta_z={dz:.2f}  alt={self.current_pos[2]:.2f}"
@@ -780,7 +847,7 @@ class WaypointFullMission(Node):
 
         # ── ARUCO_RECOVER ────────────────────────────────────────────────
         elif self.phase == "ARUCO_RECOVER":
-            self.hold(self.last_aruco_global)
+            self.hold(self.last_aruco_global, self.target_yaw)
             dist = (
                 (self.current_pos[0] - self.last_aruco_global[0]) ** 2 +
                 (self.current_pos[1] - self.last_aruco_global[1]) ** 2
