@@ -46,7 +46,7 @@ class WaypointFullMission(Node):
         )
         # ── Boundary offset (distance from yellow line) ────────────────────
         self.sub_offset = self.create_subscription(
-            Point, '/boundary_offset', self.offset_callback, qos
+            Point, '/front_back_offset', self.offset_callback, qos
         )
         self.boundary_offset = Point()   # last raw msg (x, y, z)
 
@@ -93,7 +93,7 @@ class WaypointFullMission(Node):
         # ── General flight state ────────────────────────────────────────
         self.current_pos = [0.0, 0.0, 0.0]   # calibrated-frame (world-aligned)
         self.pos_threshold = 0.25
-        self.takeoff_alt = 2.5
+        self.takeoff_alt = 2.0
         self.hover_time = 5.0            # seconds per waypoint
         self.stop_hover_time = 2.0       # settle time after boundary / corner stop
         self.counter = 0
@@ -123,7 +123,7 @@ class WaypointFullMission(Node):
 
         # BODY frame (forward_m, right_m, alt_m). alt_m is absolute.
         self.mission_body_waypoints = [
-            (-0.5, -0.5, self.takeoff_alt),
+            (-0.1, -0.5, self.takeoff_alt),
             (-1.5, -0.5, self.takeoff_alt),
             (-2.5, -0.5, self.takeoff_alt),
             (-3.5, -0.5, self.takeoff_alt),
@@ -132,8 +132,8 @@ class WaypointFullMission(Node):
             (-3.5, -1.5, self.takeoff_alt),
             (-2.5, -1.5, self.takeoff_alt),
             (-1.5, -1.5, self.takeoff_alt),
-            (-0.5, -1.5, self.takeoff_alt),
-            (-0.5, -2.5, self.takeoff_alt),
+            (-0.1, -1.5, self.takeoff_alt),
+            (-0.1, -2.5, self.takeoff_alt),
             (-1.5, -2.5, self.takeoff_alt),
             (-2.5, -2.5, self.takeoff_alt),
             (-3.5, -2.5, self.takeoff_alt),
@@ -142,8 +142,8 @@ class WaypointFullMission(Node):
             (-3.5, -3.5, self.takeoff_alt),
             (-2.5, -3.5, self.takeoff_alt),
             (-1.5, -3.5, self.takeoff_alt),
-            (-0.5, -3.5, self.takeoff_alt),
-            (-0.5, -4.5, self.takeoff_alt),
+            (-0.1, -3.5, self.takeoff_alt),
+            (-0.1, -4.5, self.takeoff_alt),
             (-1.5, -4.5, self.takeoff_alt),
             (-2.5, -4.5, self.takeoff_alt),
             (-3.5, -4.5, self.takeoff_alt),
@@ -152,12 +152,17 @@ class WaypointFullMission(Node):
             (-3.5, -5.5, self.takeoff_alt),
             (-2.5, -5.5, self.takeoff_alt),
             (-1.5, -5.5, self.takeoff_alt),
-            (-0.5, -5.5, self.takeoff_alt)
+            (-0.1, -5.5, self.takeoff_alt)
         ]
         # ──────────────────────────────────────────────────────────────
 
         self.mission_waypoints = None   # filled in after corner stop (world frame)
         self.wp_index = 0
+
+        # ── Mid-mission re-align (whenever a waypoint sits back at the line) ─
+        self.line_realign_search_time = 2.0   # seconds to look for the line before giving up
+        self.line_realign_confirm_count = 0
+        self.line_realign_applied = False
 
         # ── ArUco / precision-landing state ─────────────────────────────
         self.align_threshold = 0.1
@@ -355,6 +360,14 @@ class WaypointFullMission(Node):
         msg.data = value
         self.mission_complete_pub.publish(msg)
 
+    def _is_line_realign_wp(self, idx):
+        return math.isclose(self.mission_body_waypoints[idx][0], -0.1, abs_tol=1e-6)
+
+    def _recompute_remaining_waypoints(self, from_index):
+        for i in range(from_index, len(self.mission_body_waypoints)):
+            f, r, a = self.mission_body_waypoints[i]
+            self.mission_waypoints[i] = self.body_to_world(f, r, a, origin=self.corner_origin)
+
     def _build_search_offsets(self, home_x, home_y, home_z):
         pts = [[home_x, home_y, home_z]]
         for i in range(8):
@@ -437,7 +450,7 @@ class WaypointFullMission(Node):
             self.get_logger().info(f"Altitude = {self.current_pos[2]:.2f} m")
             if self.current_pos[2] >= (self.takeoff_alt - self.pos_threshold):
                 self.home_position = [
-                    self.current_pos[0], self.current_pos[1], self.takeoff_alt-1.0
+                    self.current_pos[0], self.current_pos[1], self.takeoff_alt
                 ]
                 self.target_yaw = self.locked_yaw
                 self.get_logger().info(
@@ -632,7 +645,12 @@ class WaypointFullMission(Node):
                 self.get_logger().info(
                     f"Mission waypoints (world frame): {self.mission_waypoints}"
                 )
-                self.phase = "HOVER2"
+                if self._is_line_realign_wp(self.wp_index):
+                    self.line_realign_confirm_count = 0
+                    self.line_realign_applied = False
+                    self.phase = "LINE_REALIGN"
+                else:
+                    self.phase = "HOVER2"
                 self.start_time = time.time()
 
         # ── MOVE2 ────────────────────────────────────────────────────────
@@ -656,7 +674,56 @@ class WaypointFullMission(Node):
 
             if self.arrived(target):
                 self.trigger(True)   # rising edge -> camera snapshot
-                self.get_logger().info(f"Reached wp{self.wp_index} -> hovering {self.hover_time}s")
+                if self._is_line_realign_wp(self.wp_index):
+                    self.get_logger().info(
+                        f"Reached wp{self.wp_index} (back at line) -> checking for realign"
+                    )
+                    self.line_realign_confirm_count = 0
+                    self.line_realign_applied = False
+                    self.phase = "LINE_REALIGN"
+                else:
+                    self.get_logger().info(f"Reached wp{self.wp_index} -> hovering {self.hover_time}s")
+                    self.phase = "HOVER2"
+                self.start_time = time.time()
+
+        # ── LINE_REALIGN: at a waypoint back near the boundary, re-square
+        #                 to the yellow line if it's visible, then continue ──
+        elif self.phase == "LINE_REALIGN":
+            target = self.mission_waypoints[self.wp_index]
+            self.hold(target, self.target_yaw)
+            elapsed = time.time() - self.start_time
+
+            if self.boundary_detected_raw:
+                self.line_realign_confirm_count += 1
+            else:
+                self.line_realign_confirm_count = 0
+            confirmed = self.line_realign_confirm_count >= self.detect_confirm_needed
+
+            if confirmed and not self.line_realign_applied:
+                err_yaw = self.boundary_offset.z
+                err_yaw = (err_yaw + math.pi / 2) % math.pi - math.pi / 2
+
+                self.yaw_arena_offset = self.locked_yaw - self.current_yaw + err_yaw
+                self.yaw_arena_offset = (self.yaw_arena_offset + math.pi) % (2 * math.pi) - math.pi
+                self.target_yaw = self.locked_yaw - self.yaw_arena_offset
+                self.target_yaw = (self.target_yaw + math.pi) % (2 * math.pi) - math.pi
+
+                self._recompute_remaining_waypoints(self.wp_index)
+                self.line_realign_applied = True
+                self.get_logger().info(
+                    f"[wp{self.wp_index}] yellow line visible -> re-aligned perpendicular, "
+                    "remaining waypoints recomputed"
+                )
+                self.start_time = time.time()
+                return
+
+            settle_needed = self.align_hover_time if self.line_realign_applied else self.line_realign_search_time
+            if elapsed >= settle_needed:
+                if not self.line_realign_applied:
+                    self.get_logger().info(
+                        f"[wp{self.wp_index}] no yellow line seen -> continuing without realign"
+                    )
+                self.get_logger().info(f"--> hovering {self.hover_time}s")
                 self.phase = "HOVER2"
                 self.start_time = time.time()
 
