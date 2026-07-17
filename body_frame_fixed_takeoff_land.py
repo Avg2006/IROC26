@@ -3,8 +3,9 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy,qos_profile_sensor_data
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Bool
 from mavros_msgs.msg import PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
 from tf_transformations import euler_from_quaternion
@@ -18,6 +19,13 @@ class WaypointMission(Node):
         self.pub = self.create_publisher(
             PositionTarget, '/mavros/setpoint_raw/local', 10
         )
+
+        self.ref_odom_pub = self.create_publisher(
+            PoseStamped,
+            '/reference_odom',
+            qos_profile_sensor_data
+        )
+        self.bool_pub = self.create_publisher(Bool, '/take_picture', 10)
         self.arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
@@ -39,7 +47,7 @@ class WaypointMission(Node):
         # ── General flight state ────────────────────────────────────────
         self.current_pos = [0.0, 0.0, 0.0]   # calibrated-frame (world-aligned)
         self.pos_threshold = 0.25
-        self.takeoff_alt = 1.5
+        self.takeoff_alt = 1.0
         self.hover_time = 5.0            # seconds per waypoint
         self.counter = 0
         self.phase = "CALIBRATE"
@@ -53,9 +61,24 @@ class WaypointMission(Node):
         self.body_waypoints = [
             (0.0, 0.0, self.takeoff_alt),   # 0: straight up to alt, hover
             (1.0, 0.0, self.takeoff_alt),   # 1: forward 1 m
-            (0.0, 0.0, self.takeoff_alt),   # 2: back to centre
-            (0.0, 1.0, self.takeoff_alt),   # 3: right 1 m
-            (0.0, 0.0, self.takeoff_alt),   # 4: back to centre
+            (2.0, 0.0, self.takeoff_alt),   # 2: back to centre
+            (3.0, 0.0, self.takeoff_alt),   # 3: right 1 m
+            (4.0, 0.0, self.takeoff_alt),   # 4: back to centre
+            (4.0, 1.0, self.takeoff_alt),   # 4: back to centre
+            (3.0, 1.0, self.takeoff_alt),   # 4: back to centre
+            (2.0, 1.0, self.takeoff_alt),   # 4: back to centre
+            (1.0, 1.0, self.takeoff_alt),   # 4: back to centre
+            (0.0, 1.0, self.takeoff_alt),   # 4: back to centre
+            (0.0, 2.0, self.takeoff_alt),   # 4: back to centre
+            (1.0, 2.0, self.takeoff_alt),   # 4: back to centre
+            (2.0, 2.0, self.takeoff_alt),   # 4: back to centre
+            (3.0, 2.0, self.takeoff_alt),   # 4: back to centre
+            (4.0, 2.0, self.takeoff_alt),   # 4: back to centre
+            (4.0, 3.0, self.takeoff_alt),   # 4: back to centre
+            (3.0, 3.0, self.takeoff_alt),   # 4: back to centre
+            (2.0, 3.0, self.takeoff_alt),   # 4: back to centre
+            (1.0, 3.0, self.takeoff_alt),   # 4: back to centre
+            (0.0, 3.0, self.takeoff_alt),   # 4: back to centre
         ]
         # ──────────────────────────────────────────────────────────────
 
@@ -127,6 +150,14 @@ class WaypointMission(Node):
         self.current_pos[1] = raw_y - self.ref_y
         self.current_pos[2] = raw_z - self.ref_z
 
+        ref_odom_msg = PoseStamped()
+        ref_odom_msg.header.stamp = self.get_clock().now().to_msg()
+        ref_odom_msg.header.frame_id = "map"
+        ref_odom_msg.pose.position.x = self.current_pos[0]
+        ref_odom_msg.pose.position.y = self.current_pos[1]
+        ref_odom_msg.pose.position.z = self.current_pos[2]
+        self.ref_odom_pub.publish(ref_odom_msg)
+
     # =====================================================================
     # Helpers
     # =====================================================================
@@ -147,6 +178,11 @@ class WaypointMission(Node):
             (self.current_pos[2] - target[2]) ** 2
         ) ** 0.5
         return dist < self.pos_threshold
+
+    def trigger(self, value=False):
+        msg = Bool()
+        msg.data = value
+        self.bool_pub.publish(msg)
 
     def takeoff(self, altitude):
         if self.takeoff_client.wait_for_service(timeout_sec=2.0):
@@ -210,6 +246,7 @@ class WaypointMission(Node):
                 self.wp_index = 0
                 self.phase = "HOVER"
                 self.start_time = time.time()
+                self.trigger(True)
 
         # ── MOVE ─────────────────────────────────────────────────────────
         elif self.phase == "MOVE":
@@ -233,6 +270,7 @@ class WaypointMission(Node):
                 self.get_logger().info(f"Reached wp{self.wp_index} -> hovering {self.hover_time}s")
                 self.phase = "HOVER"
                 self.start_time = time.time()
+                self.trigger(True)
 
         # ── HOVER ────────────────────────────────────────────────────────
         elif self.phase == "HOVER":
@@ -244,6 +282,7 @@ class WaypointMission(Node):
                     f"[wp{self.wp_index}] hovering... {self.hover_time - elapsed:.1f}s left"
                 )
             elif self.wp_index + 1 < len(self.waypoints):
+                self.trigger(False)
                 self.wp_index += 1
                 self.get_logger().info(
                     f"--> moving to wp{self.wp_index} {self.waypoints[self.wp_index]}"
@@ -251,6 +290,7 @@ class WaypointMission(Node):
                 self.phase = "MOVE"
                 self.start_time = time.time()
             else:
+                self.trigger(False)
                 self.get_logger().info("All waypoints complete -> landing")
                 self.phase = "LAND"
 
