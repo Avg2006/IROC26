@@ -120,6 +120,8 @@ class WaypointFullMission(Node):
         # ── Corner stop point -> becomes waypoint-list origin ──────────────
         self.corner_origin = None   # [x, y, z], latched when corner seen
 
+        self.yaw_kar_bc = False
+
 
         # BODY frame (forward_m, right_m, alt_m). alt_m is absolute.
         self.mission_body_waypoints = [
@@ -324,7 +326,7 @@ class WaypointFullMission(Node):
         msg = PositionTarget()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.coordinate_frame = PositionTarget.FRAME_LOCAL_NED
-        if yaw is not None:
+        if (yaw is not None) and self.yaw_kar_bc:
             msg.type_mask = (
                 PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY | PositionTarget.IGNORE_VZ |
                 PositionTarget.IGNORE_AFX | PositionTarget.IGNORE_AFY | PositionTarget.IGNORE_AFZ |
@@ -458,10 +460,15 @@ class WaypointFullMission(Node):
                     "-> searching forward for yellow line"
                 )
                 self.phase = "SEARCH_FORWARD"
+                self.target_yaw = self.current_yaw
+                self.locked_yaw = self.current_yaw
                 self.start_time = time.time()
 
         # ── SEARCH_FORWARD: fly forward until yellow line ──────────────────
         elif self.phase == "SEARCH_FORWARD":
+            self.forward_search_target = self.body_to_world(
+                    self.search_forward_distance, 0.0, self.takeoff_alt
+                )
             self.hold(self.forward_search_target, self.target_yaw)
 
             if self.boundary_detected_raw:
@@ -481,6 +488,7 @@ class WaypointFullMission(Node):
             )
 
             if confirmed:
+                self.yaw_kar_bc = True;
                 self.boundary_origin = [
                     self.current_pos[0], self.current_pos[1], self.current_pos[2]
                 ]
