@@ -59,26 +59,9 @@ class WaypointMission(Node):
         # point, expressed in BODY frame (i.e. relative to however the
         # drone happened to be facing when armed).
         self.body_waypoints = [
-            (0.0, 0.0, self.takeoff_alt),   # 0: straight up to alt, hover
-            (1.0, 0.0, self.takeoff_alt),   # 1: forward 1 m
-            (2.0, 0.0, self.takeoff_alt),   # 2: back to centre
-            (3.0, 0.0, self.takeoff_alt),   # 3: right 1 m
-            (4.0, 0.0, self.takeoff_alt),   # 4: back to centre
-            (4.0, 1.0, self.takeoff_alt),   # 4: back to centre
-            (3.0, 1.0, self.takeoff_alt),   # 4: back to centre
-            (2.0, 1.0, self.takeoff_alt),   # 4: back to centre
-            (1.0, 1.0, self.takeoff_alt),   # 4: back to centre
-            (0.0, 1.0, self.takeoff_alt),   # 4: back to centre
-            (0.0, 2.0, self.takeoff_alt),   # 4: back to centre
-            (1.0, 2.0, self.takeoff_alt),   # 4: back to centre
-            (2.0, 2.0, self.takeoff_alt),   # 4: back to centre
-            (3.0, 2.0, self.takeoff_alt),   # 4: back to centre
-            (4.0, 2.0, self.takeoff_alt),   # 4: back to centre
-            (4.0, 3.0, self.takeoff_alt),   # 4: back to centre
-            (3.0, 3.0, self.takeoff_alt),   # 4: back to centre
-            (2.0, 3.0, self.takeoff_alt),   # 4: back to centre
-            (1.0, 3.0, self.takeoff_alt),   # 4: back to centre
-            (0.0, 3.0, self.takeoff_alt),   # 4: back to centre
+            (0.0, 0.0, self.takeoff_alt),
+            (1.0, 0.0, self.takeoff_alt),
+            (0.0, 0.0, self.takeoff_alt)
         ]
         # ──────────────────────────────────────────────────────────────
 
