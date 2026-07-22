@@ -1,11 +1,13 @@
 import math
+import os
+import subprocess
 import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from geometry_msgs.msg import PoseStamped, Point, PoseArray
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32, Float32
 from mavros_msgs.msg import PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
 from tf_transformations import euler_from_quaternion
@@ -28,6 +30,10 @@ class WaypointFullMission(Node):
         self.bool_pub = self.create_publisher(Bool, '/take_picture', 10)
         # Signals that the ArUco search phase has begun
         self.mission_complete_pub = self.create_publisher(Bool, '/mission_complete', 10)
+        # Signals that transfer is complete (0=inflight, 1=transferring, 2=done)
+        self.transfer_pub = self.create_publisher(Int32, '/transfer_status', 10)
+        # Tells the charging rig it is safe to start charging
+        self.charging_pub = self.create_publisher(Bool, '/chargingOkay', 10)
         self.arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
@@ -54,6 +60,14 @@ class WaypointFullMission(Node):
         self.sub_aruco = self.create_subscription(
             PoseArray, '/aruco_poses', self.aruco_callback, qos
         )
+        # Revalidation coordinates sent back by the feature detection node
+        self.sub_revalidate = self.create_subscription(
+            PoseArray, '/feature_detection/poses', self.revalidation_callback, qos
+        )
+        # Pack voltage reported by the ESP on the charging rig
+        self.sub_voltage = self.create_subscription(
+            Float32, '/esp/total_voltage', self.voltage_callback, 10
+        )
 
         self.boundary_detected_raw = False
         self.corner_detected_raw = False
@@ -74,7 +88,6 @@ class WaypointFullMission(Node):
 
         # Debounce: require N consecutive True reads before trusting a flag
         self.detect_confirm_needed = 2
-        self.detect_corner_confirm_needed = 1
         self.boundary_confirm_count = 0
         self.corner_confirm_count = 0
 
@@ -95,7 +108,7 @@ class WaypointFullMission(Node):
         self.current_pos = [0.0, 0.0, 0.0]   # calibrated-frame (world-aligned)
         self.pos_threshold = 0.25
         self.takeoff_alt = 2.0
-        self.hover_time = 5.0            # seconds per waypoint
+        self.hover_time = 3.5            # seconds per waypoint
         self.stop_hover_time = 2.0       # settle time after boundary / corner stop
         self.counter = 0
         self.phase = "CALIBRATE"
@@ -125,27 +138,37 @@ class WaypointFullMission(Node):
 
 
         # BODY frame (forward_m, right_m, alt_m). alt_m is absolute.
-        self.mission_body_waypoints = [
-            (0.0, 0.0, self.takeoff_alt),
-            (-1.0, -0.0, self.takeoff_alt),
-            (-2.0, -0.0, self.takeoff_alt),
-            (-3.0, -0.0, self.takeoff_alt),
-            (-4.0, -0.0, self.takeoff_alt),
-            (-4.0, -1.0, self.takeoff_alt),
-            (-3.0, -2.0, self.takeoff_alt),
-            (-2.0, -2.0, self.takeoff_alt),
-            (-1.0, -2.0, self.takeoff_alt),
-            (-0.0 -2.0, self.takeoff_alt),
-            (-0.0, -3.0, self.takeoff_alt),
-            (-1.0, -3.0, self.takeoff_alt),
-            (-2.0, -3.0, self.takeoff_alt),
-            (-3.0, -3.0, self.takeoff_alt),
-            (-4.0, -3.0, self.takeoff_alt),
-            (-4.0, -4.0, self.takeoff_alt),
-            (-3.0 ,-4.0, self.takeoff_alt),
-            (-2.0, -4.0, self.takeoff_alt),
-            (-1.0, -4.0, self.takeoff_alt),
-            (-0.0, -4.0, self.takeoff_alt)
+        self.mission_body_waypoints = [     # Long
+            (-0.1, -0.5, self.takeoff_alt),
+            (-1.5, -0.5, self.takeoff_alt),
+            (-2.5, -0.5, self.takeoff_alt),
+            (-3.5, -0.5, self.takeoff_alt),
+            (-4.5, -0.5, self.takeoff_alt),
+            (-4.5, -1.5, self.takeoff_alt),
+            (-3.5, -1.5, self.takeoff_alt),
+            (-2.5, -1.5, self.takeoff_alt),
+            (-1.5, -1.5, self.takeoff_alt),
+            (-0.1, -1.5, self.takeoff_alt),
+            (-0.1, -2.5, self.takeoff_alt),
+            (-1.5, -2.5, self.takeoff_alt),
+            (-2.5, -2.5, self.takeoff_alt),
+            (-3.5, -2.5, self.takeoff_alt),
+            (-4.5, -2.5, self.takeoff_alt),
+            (-4.5, -3.5, self.takeoff_alt),
+            (-3.5, -3.5, self.takeoff_alt),
+            (-2.5, -3.5, self.takeoff_alt),
+            (-1.5, -3.5, self.takeoff_alt),
+            (-0.1, -3.5, self.takeoff_alt),
+            (-0.1, -4.5, self.takeoff_alt),
+            (-1.5, -4.5, self.takeoff_alt),
+            (-2.5, -4.5, self.takeoff_alt),
+            (-3.5, -4.5, self.takeoff_alt),
+            (-4.5, -4.5, self.takeoff_alt),
+            (-4.5, -5.5, self.takeoff_alt),
+            (-3.5, -5.5, self.takeoff_alt),
+            (-2.5, -5.5, self.takeoff_alt),
+            (-1.5, -5.5, self.takeoff_alt),
+            (-0.1, -5.5, self.takeoff_alt)
         ]
         # ──────────────────────────────────────────────────────────────
 
@@ -159,7 +182,7 @@ class WaypointFullMission(Node):
 
         # ── ArUco / precision-landing state ─────────────────────────────
         self.align_threshold = 0.1
-        self.land_alt = 0.55
+        self.land_alt = 0.8
         self.descend_step = 0.3
         self.hover_duration = 0.5        # seconds to confirm alignment before descending
         self.aruco_detected = False
@@ -170,16 +193,72 @@ class WaypointFullMission(Node):
         self.aruco_stale_timeout = 1.0
         self.descent_target = None
         self.temp_pos = None             # XY held during ARUCO_HOVER_ALIGNED
-        self.align_alt = None            # altitude latched for ARUCO_ALIGN (not re-read each tick)
 
         # ── Spiral / vicinity search around home before giving up ──────────
-        self.search_radius = 0.18        # metres
-        self.search_dwell = 0.5          # seconds to hover at each search point
+        self.search_radius = 0.5        # metres
+        self.search_dwell = 1          # seconds to hover at each search point
+        self.hover_wait_before_respiral = 3.0   # seconds to hover before re-spiraling
         self.search_offsets = []
         self.search_index = 0
         self.search_home = None
 
         self.mission_complete_sent = False
+
+        # ── Post-land image transfer ────────────────────────────────────
+        self.scp_transfer_done = False
+        self.second_transfer_done = False
+
+        # ── Charging (CHARGING_STARTED) ─────────────────────────────────
+        # battery_voltage tracks /esp/total_voltage; initial_battery_voltage is
+        # latched on entry to CHARGING_STARTED.  We leave the state once the
+        # pack has gained charge_delta_min AND cleared charge_voltage_min.
+        # /chargingOkay is published every loop tick: True only while in
+        # CHARGING_STARTED, False in every other phase.
+        self.battery_voltage = None
+        self.initial_battery_voltage = None
+        self.charge_delta_min = 0.5     # volts gained since charging began
+        self.charge_voltage_min = 15.5  # absolute volts
+
+        # ── Revalidation waypoints (from feature detection node) ────────
+        # Populated by /feature_detection/poses once transfer is complete.
+        # Each entry is [x, y, z] in the calibrated frame.
+        self.revalidation_waypoints = []
+        self.revalidate_index = 0
+        # Altitude at which revalidation passes are flown
+        self.revalidate_alt = self.takeoff_alt
+        # True once the revalidation pass has flown, so a second landing goes
+        # straight to DONE instead of charging + revalidating again.
+        self.revalidation_done = False
+        # Tick counter for the GUIDED -> arm -> takeoff sequence on re-takeoff
+        self.retake_counter = 0
+        # _takeoff_cb sends us here on success.  Overridden before the second
+        # takeoff so it does not restart the survey mission.
+        self.takeoff_success_phase = "TAKEOFF"
+
+        # ── Global per-phase watchdog ────────────────────────────────────
+        # If ANY phase runs longer than phase_timeout without transitioning,
+        # something is stuck (lost detection, marker never found, a service
+        # call that never resolves, etc). The watchdog forces a LAND, which
+        # naturally flows into AFTER_LAND and runs whichever SCP transfer is
+        # appropriate (setting /transfer_status the same way a normal landing
+        # would). A handful of phases legitimately need to run longer than
+        # two minutes (or wait indefinitely) and are exempted below.
+        self.phase_timeout = 120.0   # 2 minutes
+        self.phase_entry_time = time.time()
+        self._watchdog_last_phase = None
+        # True from the moment we commit to the revalidation sortie until its
+        # SCP transfer has run. Lets the watchdog know that a stuck phase
+        # during revalidation should trigger the SECOND transfer, not the
+        # first, when it forces a landing.
+        self.revalidation_in_progress = False
+        self.watchdog_exempt_phases = {
+            "CALIBRATE",         # fixed 3s calibration window
+            "LAND",               # already landing, nothing to time out to
+            "AFTER_LAND",         # settle + SCP transfer; handles its own timing
+            "CHARGING_STARTED",   # battery charging legitimately takes a while
+            "CHARGE_COMPLETE",    # waits indefinitely for revalidation coordinates
+            "DONE",
+        }
 
         self.pos_type_mask = (
             PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY | PositionTarget.IGNORE_VZ |
@@ -290,6 +369,52 @@ class WaypointFullMission(Node):
         else:
             self.aruco_detected = False
 
+    def voltage_callback(self, msg):
+        self.battery_voltage = float(msg.data)
+
+    def revalidation_callback(self, msg):
+        """
+        Receives revalidation coordinates from the feature detection node on
+        /feature_detection/poses.  Only accepted once the image transfer is
+        done, so stale or early messages are ignored.
+
+        This ONLY populates the queue — it never changes phase.  The list may
+        well arrive while we are still charging; we take off for the
+        revalidation pass only after CHARGING_STARTED completes.
+
+        Each Pose's (x, y) is treated as a calibrated-frame XY position;
+        z is overridden by self.revalidate_alt so we fly at survey altitude.
+        """
+        if not self.scp_transfer_done:
+            self.get_logger().warn(
+                "Received /feature_detection/poses before transfer complete -> ignoring"
+            )
+            return
+
+        if self.revalidation_done:
+            self.get_logger().warn(
+                "Received /feature_detection/poses after the revalidation pass "
+                "already flew -> ignoring"
+            )
+            return
+
+        if not msg.poses:
+            self.get_logger().warn(
+                "Received empty /feature_detection/poses -> ignoring"
+            )
+            return
+
+        self.revalidation_waypoints = [
+            [p.position.x, p.position.y, self.revalidate_alt]
+            for p in msg.poses
+        ]
+        self.revalidate_index = 0
+        self.get_logger().info(
+            f"Queued {len(self.revalidation_waypoints)} revalidation "
+            f"waypoint(s) from feature detection "
+            f"(will fly once charging completes)"
+        )
+
     def update_line_offset(self):
         y = self.boundary_offset.y
         now = time.time()
@@ -354,6 +479,22 @@ class WaypointFullMission(Node):
         msg.data = value
         self.mission_complete_pub.publish(msg)
 
+    def publish_charging_okay(self, value: bool):
+        msg = Bool()
+        msg.data = value
+        self.charging_pub.publish(msg)
+
+    def publish_transfer_status(self, state: int):
+        """Publish transfer status to the GUI.
+        0 = inflight
+        1 = transferring
+        2 = first (survey) transfer complete
+        3 = second (revalidation) transfer complete
+        """
+        msg = Int32()
+        msg.data = state
+        self.transfer_pub.publish(msg)
+
     def _is_line_realign_wp(self, idx):
         return math.isclose(self.mission_body_waypoints[idx][0], -0.1, abs_tol=1e-6)
 
@@ -390,7 +531,10 @@ class WaypointFullMission(Node):
         result = future.result()
         if result.success:
             self.get_logger().info("Takeoff command accepted")
-            self.phase = "TAKEOFF"
+            self.publish_transfer_status(0)   # GUI state 0: inflight
+            # "TAKEOFF" for the survey mission, "REVALIDATE_CLIMB" for the
+            # second takeoff — set by whoever called takeoff().
+            self.phase = self.takeoff_success_phase
         else:
             self.get_logger().warn(f"Takeoff rejected (code {result.result})")
 
@@ -403,9 +547,160 @@ class WaypointFullMission(Node):
         self.phase = "DONE"
 
     # =====================================================================
+    # Post-land image transfer
+    # =====================================================================
+    def _transfer_images(self, second_sortie=False):
+        """
+        SCP images from the Xavier's image folder to the base station using
+        sshpass for password-based authentication (no SSH key needed).
+
+        When second_sortie is False (default), this is the first, post-survey
+        transfer: it copies XAVIER_IMAGE_DIR -> BS_DEST_DIR and publishes
+        transfer status 2 on success.
+
+        When second_sortie is True, this is the post-revalidation transfer: it
+        copies XAVIER_IMAGE_REVAL_DIR -> SECOND_SORTIE_DIR and publishes
+        transfer status 3 on success.
+
+        Requires sshpass to be installed on the Xavier:
+            sudo apt install sshpass
+
+        Credentials/paths are read from scp_config.py placed next to this
+        script.
+        """
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "scp_config.py"
+        )
+
+        if not os.path.isfile(config_path):
+            self.get_logger().error(
+                f"SCP config not found at {config_path} — skipping transfer"
+            )
+            return
+
+        # Load config as a plain namespace (avoids a full import system)
+        cfg = {}
+        with open(config_path) as f:
+            exec(f.read(), cfg)  # noqa: S102  (intentional; file is local)
+
+        bs_user  = cfg.get("BS_USER", "")
+        bs_host  = cfg.get("BS_HOST", "")
+        password = cfg.get("BS_PASSWORD", "")
+
+        if second_sortie:
+            bs_dest = cfg.get("SECOND_SORTIE_DIR", "")
+            image_dir = cfg.get("XAVIER_IMAGE_REVAL_DIR", "")
+            success_status = 3
+            required_fields = (
+                "BS_USER, BS_HOST, SECOND_SORTIE_DIR, XAVIER_IMAGE_REVAL_DIR, "
+                "BS_PASSWORD"
+            )
+        else:
+            bs_dest = cfg.get("BS_DEST_DIR", "")
+            image_dir = cfg.get("XAVIER_IMAGE_DIR", "")
+            success_status = 2
+            required_fields = (
+                "BS_USER, BS_HOST, BS_DEST_DIR, XAVIER_IMAGE_DIR, BS_PASSWORD"
+            )
+
+        if not all([bs_user, bs_host, bs_dest, image_dir, password]):
+            self.get_logger().error(
+                f"scp_config.py is missing one or more required fields "
+                f"({required_fields}) — skipping"
+            )
+            return
+
+        # sshpass feeds the password non-interactively to scp
+        # -r  : recursive (transfers entire folder)
+        # -q  : quiet (suppress progress meter in log)
+        # -o StrictHostKeyChecking=no : skip interactive host-key prompt on first connect
+        cmd = [
+            "sshpass", "-p", password,
+            "scp", "-r", "-q", "-o", "StrictHostKeyChecking=no",
+            image_dir,
+            f"{bs_user}@{bs_host}:{bs_dest}",
+        ]
+
+        # Log without exposing the password
+        safe_cmd = cmd[:2] + ["****"] + cmd[3:]
+        self.get_logger().info(f"Running: {' '.join(safe_cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,   # 2-minute hard cap; raise if folder is large
+            )
+            if result.returncode == 0:
+                self.get_logger().info(
+                    "Image transfer complete "
+                    f"({'revalidation' if second_sortie else 'survey'})."
+                )
+                self.publish_transfer_status(success_status)
+            else:
+                self.get_logger().error(
+                    f"SCP failed (exit {result.returncode}): {result.stderr.strip()}"
+                )
+        except subprocess.TimeoutExpired:
+            self.get_logger().error("SCP timed out after 120 s — transfer incomplete")
+        except FileNotFoundError:
+            self.get_logger().error(
+                "sshpass not found — install it with: sudo apt install sshpass"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"SCP exception: {exc}")
+
+    def _advance_revalidation(self):
+        """Step to the next revalidation waypoint, or exit to the ArUco landing."""
+        self.revalidate_index += 1
+        if self.revalidate_index < len(self.revalidation_waypoints):
+            self.get_logger().info(
+                f"--> revalidation wp{self.revalidate_index} "
+                f"{self.revalidation_waypoints[self.revalidate_index]}"
+            )
+            self.phase = "REVALIDATE_MOVE"
+            self.start_time = time.time()
+        else:
+            self.get_logger().info(
+                "All revalidation waypoints visited -> REVALIDATE_RETURN"
+            )
+            self.revalidation_done = True
+            self.pos_threshold = 0.25   # restore landing/ArUco tolerance
+            self.phase = "REVALIDATE_RETURN"
+            self.start_time = time.time()
+
+    # =====================================================================
     # Main loop
     # =====================================================================
     def loop(self):
+        # /chargingOkay is published every tick, in every phase:
+        # True only while sitting on the pad in CHARGING_STARTED, False otherwise.
+        self.publish_charging_okay(self.phase == "CHARGING_STARTED")
+
+        # ── Global per-phase watchdog (2-minute cap on any single phase) ───
+        now = time.time()
+        if self.phase != self._watchdog_last_phase:
+            # Phase just changed (or this is the first tick) — start the clock.
+            self._watchdog_last_phase = self.phase
+            self.phase_entry_time = now
+        elif (
+            self.phase not in self.watchdog_exempt_phases
+            and (now - self.phase_entry_time) > self.phase_timeout
+        ):
+            self.get_logger().error(
+                f"[watchdog] Phase '{self.phase}' exceeded "
+                f"{self.phase_timeout:.0f}s without transitioning -> forcing LAND"
+            )
+            # If we were mid-revalidation-sortie, treat the forced landing as
+            # the end of that sortie so AFTER_LAND runs the SECOND transfer
+            # (XAVIER_IMAGE_REVAL_DIR -> SECOND_SORTIE_DIR, status 3) instead
+            # of repeating the first one.
+            if self.revalidation_in_progress and not self.revalidation_done:
+                self.revalidation_done = True
+            self.phase = "LAND"
+            self._watchdog_last_phase = self.phase
+            self.phase_entry_time = now
+
         if self.phase == "CALIBRATE":
             return
 
@@ -444,7 +739,7 @@ class WaypointFullMission(Node):
             self.get_logger().info(f"Altitude = {self.current_pos[2]:.2f} m")
             if self.current_pos[2] >= (self.takeoff_alt - self.pos_threshold):
                 self.home_position = [
-                    self.current_pos[0], self.current_pos[1], self.takeoff_alt
+                    self.current_pos[0], self.current_pos[1], 1.5
                 ]
                 self.target_yaw = self.locked_yaw
                 self.get_logger().info(
@@ -594,7 +889,7 @@ class WaypointFullMission(Node):
                 self.corner_confirm_count += 1
             else:
                 self.corner_confirm_count = 0
-            confirmed = self.corner_confirm_count >= self.detect_corner_confirm_needed
+            confirmed = self.corner_confirm_count >= self.detect_confirm_needed
 
             dist_travelled = math.sqrt(
                 (self.current_pos[0] - self.boundary_origin[0]) ** 2 +
@@ -604,7 +899,7 @@ class WaypointFullMission(Node):
             self.get_logger().info(
                 f"[search-right] dist={dist_travelled:.2f} m  offset_y={offset_y:.3f}  "
                 f"setpoint={self.line_offset_setpoint:.3f}  error={error:+.3f}  "
-                f"corner_confirm={self.corner_confirm_count}/{self.detect_corner_confirm_needed}",
+                f"corner_confirm={self.corner_confirm_count}/{self.detect_confirm_needed}",
                 throttle_duration_sec=0.5,
             )
 
@@ -798,9 +1093,13 @@ class WaypointFullMission(Node):
 
             if not self.search_offsets:
                 self.get_logger().warn(
-                    "ARUCO_SPIRAL_SEARCH entered with no offsets -> ARUCO_HOVER_WAIT"
+                    "ARUCO_SPIRAL_SEARCH entered with no offsets -> "
+                    "rebuilding around home"
                 )
-                self.phase = "ARUCO_HOVER_WAIT"
+                self.search_home = list(self.home_position)
+                self.search_offsets = self._build_search_offsets(*self.search_home)
+                self.search_index = 0
+                self.start_time = time.time()
                 return
 
             target = self.search_offsets[self.search_index]
@@ -828,14 +1127,32 @@ class WaypointFullMission(Node):
                         "Spiral search complete, ArUco not found -> ARUCO_HOVER_WAIT"
                     )
                     self.hold(self.search_home, self.target_yaw)
+                    self.start_time = time.time()
                     self.phase = "ARUCO_HOVER_WAIT"
 
-        # ── ARUCO_HOVER_WAIT: hold at home, keep scanning for the marker ────
+        # ── ARUCO_HOVER_WAIT: brief hold, then keep re-spiraling until found ─
+        # A single spiral pass can miss the marker (drift, glare, a gust
+        # mid-pass), so we never just sit here forever: after a short dwell
+        # we launch another spiral centered on home, and keep alternating
+        # hover <-> spiral for as long as ArUco stays hidden. The global
+        # watchdog is the only thing that eventually cuts this loop off.
         elif self.phase == "ARUCO_HOVER_WAIT":
-            self.hold([self.home_position[0],self.home_position[1],min(self.current_pos[2]+0.05, self.takeoff_alt)], self.target_yaw)
+            self.hold(self.home_position, self.target_yaw)
             if self.aruco_detected:
                 self.get_logger().info("ArUco detected -> ARUCO_ALIGN")
                 self.phase = "ARUCO_ALIGN"
+                return
+
+            elapsed = time.time() - self.start_time
+            if elapsed >= self.hover_wait_before_respiral:
+                self.get_logger().info(
+                    "Still no ArUco marker -> re-running spiral search"
+                )
+                self.search_home = list(self.home_position)
+                self.search_offsets = self._build_search_offsets(*self.search_home)
+                self.search_index = 0
+                self.start_time = time.time()
+                self.phase = "ARUCO_SPIRAL_SEARCH"
             else:
                 self.get_logger().info(
                     "Hovering at home... waiting for ArUco marker",
@@ -845,17 +1162,14 @@ class WaypointFullMission(Node):
         # ── ARUCO_ALIGN ──────────────────────────────────────────────────
         elif self.phase == "ARUCO_ALIGN":
             if not self.aruco_detected:
-                self.align_alt = None
                 if self.last_aruco_global is not None:
                     self.get_logger().warn("ArUco lost during ALIGN -> ARUCO_RECOVER")
                     self.phase = "ARUCO_RECOVER"
                 else:
                     self.get_logger().warn("ArUco lost, no global target -> ARUCO_HOVER_WAIT")
+                    self.start_time = time.time()
                     self.phase = "ARUCO_HOVER_WAIT"
                 return
-
-            if self.align_alt is None:
-                self.align_alt = self.current_pos[2]
 
             self.get_logger().info(
                 f"Aligning | err_x={self.error_x:+.3f}  err_y={self.error_y:+.3f}  "
@@ -868,12 +1182,11 @@ class WaypointFullMission(Node):
             target = [
                 self.current_pos[0] + error_x,
                 self.current_pos[1] - error_y,
-                self.align_alt,
+                self.current_pos[2],
             ]
-            self.hold(target, self.target_yaw)
+            self.hold(target)
 
             if self.xy_aligned():
-                self.align_alt = None
                 self.get_logger().info("Aligned -> ARUCO_HOVER_ALIGNED")
                 self.start_time = time.time()
                 self.temp_pos = [
@@ -938,11 +1251,240 @@ class WaypointFullMission(Node):
                 self.get_logger().info(
                     "Reached last known ArUco pos, still no marker -> ARUCO_HOVER_WAIT"
                 )
+                self.start_time = time.time()
                 self.phase = "ARUCO_HOVER_WAIT"
 
         # ── LAND ─────────────────────────────────────────────────────────
         elif self.phase == "LAND":
             self.land()
+            self.phase = "AFTER_LAND"
+            self.start_time = time.time()
+
+        # ── AFTER_LAND: wait for motors to stop, then SCP images ──────────
+        elif self.phase == "AFTER_LAND":
+            elapsed = time.time() - self.start_time
+            # Give the drone a few seconds to fully settle before touching the FS
+            settle_time = 5.0
+            if elapsed < settle_time:
+                self.get_logger().info(
+                    f"Settling after land... {settle_time - elapsed:.1f}s",
+                    throttle_duration_sec=1.0,
+                )
+                return
+
+            if self.revalidation_done:
+                # Second landing — the revalidation pass has already flown.
+                # Run the second SCP transfer (revalidation images) once,
+                # then finish.
+                if not self.second_transfer_done:
+                    self.get_logger().info(
+                        "Starting second image transfer "
+                        "(revalidation) to base station..."
+                    )
+                    self.publish_transfer_status(1)   # GUI state 1: transferring
+                    self._transfer_images(second_sortie=True)
+                    self.second_transfer_done = True
+                    self.revalidation_in_progress = False
+
+                self.get_logger().info("Revalidation pass complete -> DONE")
+                self.phase = "DONE"
+                return
+
+            if not self.scp_transfer_done:
+                self.get_logger().info("Starting image transfer to base station...")
+                self.publish_transfer_status(1)   # GUI state 1: transferring
+                self._transfer_images()
+                self.scp_transfer_done = True
+
+            self.get_logger().info("Transfer done -> CHARGING_STARTED")
+            self.initial_battery_voltage = self.battery_voltage
+            self.phase = "CHARGING_STARTED"
+            self.start_time = time.time()
+
+        # ── CHARGING_STARTED: sit on the pad until the pack has charged ────
+        # /chargingOkay is held True for the whole phase by the publisher at
+        # the top of loop().
+        elif self.phase == "CHARGING_STARTED":
+            if self.battery_voltage is None:
+                self.get_logger().warn(
+                    "Waiting for /esp/total_voltage...",
+                    throttle_duration_sec=2.0,
+                )
+                return
+
+            # No reading had arrived when we entered the state — latch the
+            # first one we get as the baseline.
+            if self.initial_battery_voltage is None:
+                self.initial_battery_voltage = self.battery_voltage
+                self.get_logger().info(
+                    f"Initial battery voltage = {self.initial_battery_voltage:.2f} V"
+                )
+
+            delta = self.battery_voltage - self.initial_battery_voltage
+            self.get_logger().info(
+                f"Charging... V={self.battery_voltage:.2f} "
+                f"(start {self.initial_battery_voltage:.2f}, "
+                f"delta {delta:+.2f}/{self.charge_delta_min:.2f}, "
+                f"need > {self.charge_voltage_min:.2f})",
+                throttle_duration_sec=2.0,
+            )
+
+            if delta > self.charge_delta_min and self.battery_voltage > self.charge_voltage_min:
+                self.get_logger().info(
+                    f"Charge complete at {self.battery_voltage:.2f} V "
+                    "-> CHARGE_COMPLETE"
+                )
+                self.phase = "CHARGE_COMPLETE"
+                self.start_time = time.time()
+
+        # ── CHARGE_COMPLETE: charged, on the pad, waiting for coordinates ──
+        # If the feature-detection list already arrived during charging we go
+        # straight up.  Otherwise we sit here and warn until it shows up.
+        elif self.phase == "CHARGE_COMPLETE":
+            if self.revalidation_waypoints:
+                self.get_logger().info(
+                    f"{len(self.revalidation_waypoints)} revalidation waypoint(s) "
+                    "ready -> REVALIDATE_TAKEOFF"
+                )
+                self.retake_counter = 0
+                self.revalidation_in_progress = True
+                self.phase = "REVALIDATE_TAKEOFF"
+                return
+
+            self.get_logger().warn(
+                "Charging complete but no revalidation coordinates received on "
+                "/feature_detection/poses yet — staying on the pad, waiting...",
+                throttle_duration_sec=5.0,
+            )
+
+        # ── REVALIDATE_TAKEOFF: GUIDED -> arm -> takeoff, second time round ─
+        # The drone is disarmed and in LAND mode after the first landing, so the
+        # full mode/arm/takeoff sequence has to be re-issued before any setpoint
+        # will be acted on.
+        elif self.phase == "REVALIDATE_TAKEOFF":
+            if self.retake_counter == 0:
+                self.get_logger().info("Re-takeoff: switching to GUIDED...")
+                if self.mode_client.wait_for_service(timeout_sec=2.0):
+                    req = SetMode.Request()
+                    req.custom_mode = "GUIDED"
+                    self.mode_client.call_async(req)
+
+            elif self.retake_counter == 20:
+                self.get_logger().info("Re-takeoff: arming...")
+                if self.arm_client.wait_for_service(timeout_sec=2.0):
+                    req = CommandBool.Request()
+                    req.value = True
+                    self.arm_client.call_async(req)
+
+            elif self.retake_counter == 40:
+                self.get_logger().info(
+                    f"Re-takeoff: sending takeoff to {self.takeoff_alt} m..."
+                )
+                # Land back at the pad afterwards via the ArUco phases, not by
+                # restarting the survey.
+                self.takeoff_success_phase = "REVALIDATE_CLIMB"
+                self.takeoff(self.takeoff_alt)
+
+            self.retake_counter += 1
+
+        # ── REVALIDATE_CLIMB: wait until back at survey altitude ───────────
+        elif self.phase == "REVALIDATE_CLIMB":
+            self.get_logger().info(
+                f"Re-takeoff climbing... altitude = {self.current_pos[2]:.2f} m",
+                throttle_duration_sec=1.0,
+            )
+            if self.current_pos[2] >= (self.takeoff_alt - self.pos_threshold):
+                self.get_logger().info("Back at altitude -> REVALIDATE_MOVE")
+                self.pos_threshold = 0.1   # tighter tolerance for revalidation
+                self.phase = "REVALIDATE_MOVE"
+                self.start_time = time.time()
+
+        # ── REVALIDATE_MOVE: fly to the next feature-detection coordinate ──
+        elif self.phase == "REVALIDATE_MOVE":
+            target = self.revalidation_waypoints[self.revalidate_index]
+            self.hold(target, self.target_yaw)
+
+            elapsed_move = time.time() - self.start_time
+            if elapsed_move > self.move_timeout:
+                self.get_logger().error(
+                    f"[revalidate wp{self.revalidate_index}] Timeout! Skipping to next."
+                )
+                self._advance_revalidation()
+                return
+
+            dx = target[0] - self.current_pos[0]
+            dy = target[1] - self.current_pos[1]
+            dz = target[2] - self.current_pos[2]
+            self.get_logger().info(
+                f"[revalidate {self.revalidate_index + 1}/"
+                f"{len(self.revalidation_waypoints)}] "
+                f"moving  dx={dx:+.2f} dy={dy:+.2f} dz={dz:+.2f}",
+                throttle_duration_sec=0.5,
+            )
+
+            if self.arrived(target):
+                self.get_logger().info(
+                    f"Reached revalidation wp{self.revalidate_index} "
+                    "-> REVALIDATE_HOVER"
+                )
+                self.trigger(True)   # rising edge -> camera snapshot
+                self.phase = "REVALIDATE_HOVER"
+                self.start_time = time.time()
+
+        # ── REVALIDATE_HOVER: hold, take picture, then continue ────────────
+        elif self.phase == "REVALIDATE_HOVER":
+            target = self.revalidation_waypoints[self.revalidate_index]
+            self.hold(target, self.target_yaw)
+            elapsed = time.time() - self.start_time
+
+            if elapsed < self.hover_time:
+                self.get_logger().info(
+                    f"[revalidate {self.revalidate_index + 1}/"
+                    f"{len(self.revalidation_waypoints)}] "
+                    f"hovering... {self.hover_time - elapsed:.1f}s left",
+                    throttle_duration_sec=0.5,
+                )
+            else:
+                self.trigger(False)  # reset camera latch
+                self._advance_revalidation()
+
+        # ── REVALIDATE_RETURN: fly home for the final ArUco landing ────────
+        # Same behaviour as the survey's return leg: scan for the marker on the
+        # way, and if we get all the way home without seeing it, run the spiral
+        # search.  Ends in LAND -> AFTER_LAND -> DONE (with the second SCP
+        # transfer running in AFTER_LAND).
+        elif self.phase == "REVALIDATE_RETURN":
+            self.hold(self.home_position, self.target_yaw)
+
+            elapsed = time.time() - self.start_time
+            if elapsed > self.move_timeout:
+                self.get_logger().error("Return-home timeout! Landing...")
+                self.phase = "LAND"
+                return
+
+            dx = self.home_position[0] - self.current_pos[0]
+            dy = self.home_position[1] - self.current_pos[1]
+            self.get_logger().info(
+                f"[return home] moving  dx={dx:+.2f} dy={dy:+.2f}",
+                throttle_duration_sec=0.5,
+            )
+
+            # ArUco spotted en-route -> align and land straight away
+            if self.aruco_detected:
+                self.get_logger().info("ArUco detected en-route home -> ARUCO_ALIGN")
+                self.phase = "ARUCO_ALIGN"
+                return
+
+            if self.arrived(self.home_position):
+                self.get_logger().info(
+                    "Arrived home after revalidation, no ArUco yet "
+                    "-> ARUCO_SPIRAL_SEARCH"
+                )
+                self.search_home = list(self.home_position)
+                self.search_offsets = self._build_search_offsets(*self.search_home)
+                self.search_index = 0
+                self.start_time = time.time()
+                self.phase = "ARUCO_SPIRAL_SEARCH"
 
         # ── DONE ─────────────────────────────────────────────────────────
         elif self.phase == "DONE":
