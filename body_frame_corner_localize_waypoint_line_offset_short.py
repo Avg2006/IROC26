@@ -1,11 +1,13 @@
 import math
+import os
+import subprocess
 import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from geometry_msgs.msg import PoseStamped, Point, PoseArray
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32, Float32
 from mavros_msgs.msg import PositionTarget
 from mavros_msgs.srv import CommandBool, SetMode, CommandTOL
 from tf_transformations import euler_from_quaternion
@@ -28,6 +30,10 @@ class WaypointFullMission(Node):
         self.bool_pub = self.create_publisher(Bool, '/take_picture', 10)
         # Signals that the ArUco search phase has begun
         self.mission_complete_pub = self.create_publisher(Bool, '/mission_complete', 10)
+        # Signals transfer status to the GUI (0=inflight, 1=transferring, 2=done)
+        self.transfer_pub = self.create_publisher(Int32, '/transfer_status', 10)
+        # Tells the charging rig it is safe to start charging
+        self.charging_pub = self.create_publisher(Bool, '/chargingOkay', 10)
         self.arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.takeoff_client = self.create_client(CommandTOL, '/mavros/cmd/takeoff')
@@ -54,6 +60,10 @@ class WaypointFullMission(Node):
         self.sub_aruco = self.create_subscription(
             PoseArray, '/aruco_poses', self.aruco_callback, qos
         )
+        # Pack voltage reported by the ESP on the charging rig
+        self.sub_voltage = self.create_subscription(
+            Float32, '/esp/total_voltage', self.voltage_callback, 10
+        )
 
         self.boundary_detected_raw = False
         self.corner_detected_raw = False
@@ -74,6 +84,7 @@ class WaypointFullMission(Node):
 
         # Debounce: require N consecutive True reads before trusting a flag
         self.detect_confirm_needed = 2
+        self.detect_corner_confirm_needed = 1
         self.boundary_confirm_count = 0
         self.corner_confirm_count = 0
 
@@ -123,11 +134,62 @@ class WaypointFullMission(Node):
         self.yaw_kar_bc = False
 
 
-        # BODY frame (forward_m, right_m, alt_m). alt_m is absolute.
+        # BODY frame (forward_m, right_m, alt_m). alt_m is absolute
+        # self.mission_body_waypoints = [
+        #     (0.0, 0.0, self.takeoff_alt),
+        #     (-1.0, -0.0, self.takeoff_alt),
+        #     # (-3.0, -3.0, self.takeoff_alt)
+        # ]
+
         self.mission_body_waypoints = [
-            (0.0, 0.0, self.takeoff_alt),
-            (0.0, -0.5, self.takeoff_alt),
-            (0.0, 0.0, self.takeoff_alt),
+            (-0.0, -0.0, self.takeoff_alt),
+            (-1.0, -0.0, self.takeoff_alt),
+            (-2.0, -0.0, self.takeoff_alt),
+            (-3.0, -0.0, self.takeoff_alt),
+            (-4.0, -0.0, self.takeoff_alt),
+            (-5.0, -0.0, self.takeoff_alt),
+            (-5.0, -1.0, self.takeoff_alt),
+            (-4.0, -1.0, self.takeoff_alt),
+            (-3.0, -1.0, self.takeoff_alt),
+            (-2.0, -1.0, self.takeoff_alt),
+            (-1.0, -1.0, self.takeoff_alt),
+            (-0.0, -1.0, self.takeoff_alt),
+            (-0.0, -2.0, self.takeoff_alt),
+            (-1.0, -2.0, self.takeoff_alt),
+            (-2.0, -2.0, self.takeoff_alt),
+            (-3.0, -2.0, self.takeoff_alt),
+            (-4.0, -2.0, self.takeoff_alt),
+            (-5.0, -2.0, self.takeoff_alt),
+            (-5.0, -3.0, self.takeoff_alt),
+            (-4.0, -3.0, self.takeoff_alt),
+            (-3.0, -3.0, self.takeoff_alt),
+            (-2.0, -3.0, self.takeoff_alt),
+            (-1.0, -3.0, self.takeoff_alt),
+            (-0.0, -3.0, self.takeoff_alt),
+            (-0.0, -4.0, self.takeoff_alt),
+            (-1.0, -4.0, self.takeoff_alt),
+            (-2.0, -4.0, self.takeoff_alt),
+            (-3.0, -4.0, self.takeoff_alt),
+            (-4.0, -4.0, self.takeoff_alt),
+            (-5.0, -4.0, self.takeoff_alt),
+            (-5.0, -5.0, self.takeoff_alt),
+            (-4.0, -5.0, self.takeoff_alt),
+            (-3.0, -5.0, self.takeoff_alt),
+            (-2.0, -5.0, self.takeoff_alt),
+            (-1.0, -5.0, self.takeoff_alt),
+            (-0.0, -5.0, self.takeoff_alt),
+            (-0.0, -6.0, self.takeoff_alt),
+            (-1.0, -6.0, self.takeoff_alt),
+            (-2.0, -6.0, self.takeoff_alt),
+            (-3.0, -6.0, self.takeoff_alt),
+            (-4.0, -6.0, self.takeoff_alt),
+            (-5.0, -6.0, self.takeoff_alt),
+            (-5.0, -7.0, self.takeoff_alt),
+            (-4.0, -7.0, self.takeoff_alt),
+            (-3.0, -7.0, self.takeoff_alt),
+            (-2.0, -7.0, self.takeoff_alt),
+            (-1.0, -7.0, self.takeoff_alt),
+            (-0.0, -7.0, self.takeoff_alt)
         ]
         # ──────────────────────────────────────────────────────────────
 
@@ -162,6 +224,37 @@ class WaypointFullMission(Node):
         self.search_home = None
 
         self.mission_complete_sent = False
+
+        # ── Post-land image transfer ────────────────────────────────────
+        self.scp_transfer_done = False
+
+        # ── Charging (CHARGING_STARTED) ─────────────────────────────────
+        # battery_voltage tracks /esp/total_voltage; initial_battery_voltage is
+        # latched on entry to CHARGING_STARTED.  We leave the state once the
+        # pack has gained charge_delta_min AND cleared charge_voltage_min.
+        # /chargingOkay is published every loop tick: True only while in
+        # CHARGING_STARTED, False in every other phase.
+        self.battery_voltage = None
+        self.initial_battery_voltage = None
+        self.charge_delta_min = 0.55     # volts gained since charging began
+        self.charge_voltage_min = 15.5  # absolute volts
+
+        # ── Global per-phase watchdog ────────────────────────────────────
+        # If ANY phase runs longer than phase_timeout without transitioning,
+        # something is stuck (lost detection, marker never found, a service
+        # call that never resolves, etc). The watchdog forces a LAND, which
+        # naturally flows into AFTER_LAND and runs the SCP transfer the same
+        # way a normal landing would.
+        self.phase_timeout = 120.0   # 2 minutes
+        self.phase_entry_time = time.time()
+        self._watchdog_last_phase = None
+        self.watchdog_exempt_phases = {
+            "CALIBRATE",         # fixed 3s calibration window
+            "LAND",               # already landing, nothing to time out to
+            "AFTER_LAND",         # settle + SCP transfer; handles its own timing
+            "CHARGING_STARTED",   # battery charging legitimately takes a while
+            "DONE",
+        }
 
         self.pos_type_mask = (
             PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY | PositionTarget.IGNORE_VZ |
@@ -214,7 +307,7 @@ class WaypointFullMission(Node):
                 self.reference_set = True
 
                 self.forward_search_target = self.body_to_world(
-                    self.search_forward_distance, 0.0, self.takeoff_alt
+                    self.search_forward_distance, -0.0, self.takeoff_alt
                 )
 
                 self.phase = "INIT"
@@ -271,6 +364,9 @@ class WaypointFullMission(Node):
             )
         else:
             self.aruco_detected = False
+
+    def voltage_callback(self, msg):
+        self.battery_voltage = float(msg.data)
 
     def update_line_offset(self):
         y = self.boundary_offset.y
@@ -336,8 +432,23 @@ class WaypointFullMission(Node):
         msg.data = value
         self.mission_complete_pub.publish(msg)
 
+    def publish_charging_okay(self, value: bool):
+        msg = Bool()
+        msg.data = value
+        self.charging_pub.publish(msg)
+
+    def publish_transfer_status(self, state: int):
+        """Publish transfer status to the GUI.
+        0 = inflight
+        1 = transferring
+        2 = transfer complete
+        """
+        msg = Int32()
+        msg.data = state
+        self.transfer_pub.publish(msg)
+
     def _is_line_realign_wp(self, idx):
-        return math.isclose(self.mission_body_waypoints[idx][0], -0.1, abs_tol=1e-6)
+        return math.isclose(self.mission_body_waypoints[idx][0], 0.0, abs_tol=1e-6)
 
     def _recompute_remaining_waypoints(self, from_index):
         for i in range(from_index, len(self.mission_body_waypoints)):
@@ -372,6 +483,7 @@ class WaypointFullMission(Node):
         result = future.result()
         if result.success:
             self.get_logger().info("Takeoff command accepted")
+            self.publish_transfer_status(0)   # GUI state 0: inflight
             self.phase = "TAKEOFF"
         else:
             self.get_logger().warn(f"Takeoff rejected (code {result.result})")
@@ -385,13 +497,115 @@ class WaypointFullMission(Node):
         self.phase = "DONE"
 
     # =====================================================================
+    # Post-land image transfer
+    # =====================================================================
+    def _transfer_images(self):
+        """
+        SCP images from the Xavier's image folder to the base station using
+        sshpass for password-based authentication (no SSH key needed).
+
+        Requires sshpass to be installed on the Xavier:
+            sudo apt install sshpass
+
+        Credentials/paths are read from scp_config.py placed next to this
+        script.
+        """
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "scp_config.py"
+        )
+
+        if not os.path.isfile(config_path):
+            self.get_logger().error(
+                f"SCP config not found at {config_path} — skipping transfer"
+            )
+            return
+
+        # Load config as a plain namespace (avoids a full import system)
+        cfg = {}
+        with open(config_path) as f:
+            exec(f.read(), cfg)  # noqa: S102  (intentional; file is local)
+
+        bs_user  = cfg.get("BS_USER", "")
+        bs_host  = cfg.get("BS_HOST", "")
+        password = cfg.get("BS_PASSWORD", "")
+        bs_dest = cfg.get("BS_DEST_DIR", "")
+        image_dir = cfg.get("XAVIER_IMAGE_DIR", "")
+
+        if not all([bs_user, bs_host, bs_dest, image_dir, password]):
+            self.get_logger().error(
+                "scp_config.py is missing one or more required fields "
+                "(BS_USER, BS_HOST, BS_DEST_DIR, XAVIER_IMAGE_DIR, BS_PASSWORD) "
+                "— skipping"
+            )
+            return
+
+        # sshpass feeds the password non-interactively to scp
+        # -r  : recursive (transfers entire folder)
+        # -q  : quiet (suppress progress meter in log)
+        # -o StrictHostKeyChecking=no : skip interactive host-key prompt on first connect
+        cmd = [
+            "sshpass", "-p", password,
+            "scp", "-r", "-q", "-o", "StrictHostKeyChecking=no",
+            image_dir,
+            f"{bs_user}@{bs_host}:{bs_dest}",
+        ]
+
+        # Log without exposing the password
+        safe_cmd = cmd[:2] + ["****"] + cmd[3:]
+        self.get_logger().info(f"Running: {' '.join(safe_cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,   # 2-minute hard cap; raise if folder is large
+            )
+            if result.returncode == 0:
+                self.get_logger().info("Image transfer complete.")
+                self.publish_transfer_status(2)
+            else:
+                self.get_logger().error(
+                    f"SCP failed (exit {result.returncode}): {result.stderr.strip()}"
+                )
+        except subprocess.TimeoutExpired:
+            self.get_logger().error("SCP timed out after 120 s — transfer incomplete")
+        except FileNotFoundError:
+            self.get_logger().error(
+                "sshpass not found — install it with: sudo apt install sshpass"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"SCP exception: {exc}")
+
+    # =====================================================================
     # Main loop
     # =====================================================================
     def loop(self):
+        # /chargingOkay is published every tick, in every phase:
+        # True only while sitting on the pad in CHARGING_STARTED, False otherwise.
+        self.publish_charging_okay(self.phase == "CHARGING_STARTED")
+
+        # ── Global per-phase watchdog (2-minute cap on any single phase) ───
+        now = time.time()
+        if self.phase != self._watchdog_last_phase:
+            # Phase just changed (or this is the first tick) — start the clock.
+            self._watchdog_last_phase = self.phase
+            self.phase_entry_time = now
+        elif (
+            self.phase not in self.watchdog_exempt_phases
+            and (now - self.phase_entry_time) > self.phase_timeout
+        ):
+            self.get_logger().error(
+                f"[watchdog] Phase '{self.phase}' exceeded "
+                f"{self.phase_timeout:.0f}s without transitioning -> forcing LAND"
+            )
+            self.phase = "LAND"
+            self._watchdog_last_phase = self.phase
+            self.phase_entry_time = now
+
         if self.phase == "CALIBRATE":
             return
 
-        self.align_threshold = 0.15 + 0.3 * (
+        self.align_threshold = 0.1 + 0.2 * (
             (self.current_pos[2] - self.land_alt) / (self.takeoff_alt - self.land_alt)
         )
 
@@ -429,19 +643,13 @@ class WaypointFullMission(Node):
                     self.current_pos[0], self.current_pos[1], self.takeoff_alt
                 ]
                 self.target_yaw = self.locked_yaw
-                self.target_yaw = self.current_yaw
-                self.locked_yaw = self.current_yaw
-
-                self.mission_waypoints = [
-                    self.body_to_world(f, r, a, origin=self.home_position)
-                    for (f, r, a) in self.mission_body_waypoints
-                ]
-                self.wp_index = 0
                 self.get_logger().info(
                     f"Takeoff altitude reached, HOME latched at {self.home_position} "
-                    "-> following waypoints"
+                    "-> searching forward for yellow line"
                 )
-                self.phase = "HOVER2"
+                self.phase = "SEARCH_FORWARD"
+                self.target_yaw = self.current_yaw
+                self.locked_yaw = self.current_yaw
                 self.start_time = time.time()
 
         # ── SEARCH_FORWARD: fly forward until yellow line ──────────────────
@@ -582,7 +790,7 @@ class WaypointFullMission(Node):
                 self.corner_confirm_count += 1
             else:
                 self.corner_confirm_count = 0
-            confirmed = self.corner_confirm_count >= self.detect_confirm_needed
+            confirmed = self.corner_confirm_count >= self.detect_corner_confirm_needed
 
             dist_travelled = math.sqrt(
                 (self.current_pos[0] - self.boundary_origin[0]) ** 2 +
@@ -592,7 +800,7 @@ class WaypointFullMission(Node):
             self.get_logger().info(
                 f"[search-right] dist={dist_travelled:.2f} m  offset_y={offset_y:.3f}  "
                 f"setpoint={self.line_offset_setpoint:.3f}  error={error:+.3f}  "
-                f"corner_confirm={self.corner_confirm_count}/{self.detect_confirm_needed}",
+                f"corner_confirm={self.corner_confirm_count}/{self.detect_corner_confirm_needed}",
                 throttle_duration_sec=0.5,
             )
 
@@ -931,6 +1139,65 @@ class WaypointFullMission(Node):
         # ── LAND ─────────────────────────────────────────────────────────
         elif self.phase == "LAND":
             self.land()
+            self.phase = "AFTER_LAND"
+            self.start_time = time.time()
+
+        # ── AFTER_LAND: wait for motors to stop, then SCP images ──────────
+        elif self.phase == "AFTER_LAND":
+            elapsed = time.time() - self.start_time
+            # Give the drone a few seconds to fully settle before touching the FS
+            settle_time = 5.0
+            if elapsed < settle_time:
+                self.get_logger().info(
+                    f"Settling after land... {settle_time - elapsed:.1f}s",
+                    throttle_duration_sec=1.0,
+                )
+                return
+
+            if not self.scp_transfer_done:
+                self.get_logger().info("Starting image transfer to base station...")
+                self.publish_transfer_status(1)   # GUI state 1: transferring
+                self._transfer_images()
+                self.scp_transfer_done = True
+
+            self.get_logger().info("Transfer done -> CHARGING_STARTED")
+            self.initial_battery_voltage = self.battery_voltage
+            self.phase = "CHARGING_STARTED"
+            self.start_time = time.time()
+
+        # ── CHARGING_STARTED: sit on the pad until the pack has charged ────
+        # /chargingOkay is held True for the whole phase by the publisher at
+        # the top of loop().
+        elif self.phase == "CHARGING_STARTED":
+            if self.battery_voltage is None:
+                self.get_logger().warn(
+                    "Waiting for /esp/total_voltage...",
+                    throttle_duration_sec=2.0,
+                )
+                return
+
+            # No reading had arrived when we entered the state — latch the
+            # first one we get as the baseline.
+            if self.initial_battery_voltage is None:
+                self.initial_battery_voltage = self.battery_voltage
+                self.get_logger().info(
+                    f"Initial battery voltage = {self.initial_battery_voltage:.2f} V"
+                )
+
+            delta = self.battery_voltage - self.initial_battery_voltage
+            self.get_logger().info(
+                f"Charging... V={self.battery_voltage:.2f} "
+                f"(start {self.initial_battery_voltage:.2f}, "
+                f"delta {delta:+.2f}/{self.charge_delta_min:.2f}, "
+                f"need > {self.charge_voltage_min:.2f})",
+                throttle_duration_sec=2.0,
+            )
+
+            if delta > self.charge_delta_min and self.battery_voltage > self.charge_voltage_min:
+                self.get_logger().info(
+                    f"Charge complete at {self.battery_voltage:.2f} V -> DONE"
+                )
+                self.phase = "DONE"
 
         # ── DONE ─────────────────────────────────────────────────────────
         elif self.phase == "DONE":

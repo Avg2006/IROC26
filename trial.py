@@ -57,7 +57,7 @@ class WaypointFullMission(Node):
 
         self.boundary_detected_raw = False
         self.corner_detected_raw = False
-        self.min_move_before_boundary = 0.3  # meters from takeoff point
+        self.min_move_before_boundary = 1.0  # meters from takeoff point
         self.boundary_detection_started = False
 
         # ── Line-offset hold (maintain fixed standoff from yellow line) ────
@@ -135,7 +135,7 @@ class WaypointFullMission(Node):
             (-3.0, -2.0, self.takeoff_alt),
             (-2.0, -2.0, self.takeoff_alt),
             (-1.0, -2.0, self.takeoff_alt),
-            (-0.0 -2.0, self.takeoff_alt),
+            (-0.0, -2.0, self.takeoff_alt),
             (-0.0, -3.0, self.takeoff_alt),
             (-1.0, -3.0, self.takeoff_alt),
             (-2.0, -3.0, self.takeoff_alt),
